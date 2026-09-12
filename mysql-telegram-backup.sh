@@ -154,7 +154,7 @@ if [[ -n "$PROXY" ]]; then
     *) die "invalid proxy: $PROXY (must start with http:// or socks5h://)" ;;
   esac
   CURL_PROXY=(--proxy "$PROXY")
-  log "using proxy: ${PROXY%%:*}://...${PROXY##*@}"
+  log "using proxy: $(sed -E 's#://[^@/]*@#://***:***@#' <<<"$PROXY")"
   curl -sS --max-time 25 "${CURL_PROXY[@]}" -o /dev/null \
        "${TG_API}/bot${BOT_TOKEN}/getMe" \
     && log "telegram reachable through the proxy" \

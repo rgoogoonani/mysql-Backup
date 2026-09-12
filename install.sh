@@ -44,10 +44,13 @@ fetch_script() {
     info "using local ${SCRIPT_NAME}"
     install -m 750 "${here}/${SCRIPT_NAME}" "$BIN_PATH"
   else
-    local branch
+    local branch ts
+    ts="$(date +%s)"   # cache buster: raw.githubusercontent and http proxies cache responses
     for branch in main master; do
       info "downloading the script from branch ${branch} ..."
-      if curl -fsSL --max-time 60 "${CURL_PROXY[@]}" "${REPO_RAW}/${branch}/${SCRIPT_NAME}" -o /tmp/${SCRIPT_NAME}.dl; then
+      if curl -fsSL --max-time 60 "${CURL_PROXY[@]}" \
+              -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+              "${REPO_RAW}/${branch}/${SCRIPT_NAME}?nocache=${ts}" -o /tmp/${SCRIPT_NAME}.dl; then
         install -m 750 /tmp/${SCRIPT_NAME}.dl "$BIN_PATH"
         rm -f /tmp/${SCRIPT_NAME}.dl
         break
