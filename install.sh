@@ -213,61 +213,116 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
 
   SQLBIN="$(command -v mysql || command -v mariadb || true)"
   BACKUP_USER_CREATED=0
+  ADMIN_CNF=""
+  ADMIN_ARGS=()
 
-  echo
-  echo "Create a dedicated backup user with a random password?"
-  echo "(recommended, so the root password does not end up in the config file)"
-  read -rp "[Y/n]: " a
-  if [[ "${a,,}" != "n" && -n "$SQLBIN" ]]; then
-    # --- find a way to talk to the server as an admin ---
-    ADMIN_CNF=""
-    if "$SQLBIN" --protocol=socket -e "SELECT 1" >/dev/null 2>&1; then
-      info "connected as admin over the local socket"
-      ADMIN_ARGS=(--protocol=socket)
-    else
-      echo "Admin credentials are needed once to create the user (they are not stored):"
-      read -rp "  Admin user [root]: " ADM_USER; ADM_USER="${ADM_USER:-root}"
-      read -rsp "  Admin password: " ADM_PASS; echo
-      ADMIN_CNF="$(mktemp)"; chmod 600 "$ADMIN_CNF"
-      printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
-        "$ADM_USER" "$ADM_PASS" "$DB_HOST" "$DB_PORT" >"$ADMIN_CNF"
-      ADMIN_ARGS=(--defaults-extra-file="$ADMIN_CNF")
-    fi
-
-    if "$SQLBIN" "${ADMIN_ARGS[@]}" -e "SELECT 1" >/dev/null 2>&1; then
-      # 28 chars, letters+digits only so no SQL/shell quoting surprises
-      GEN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 28)"
-      read -rp "User name [backup]: " BK_USER; BK_USER="${BK_USER:-backup}"
-      GRANTS="SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, RELOAD, PROCESS, REPLICATION CLIENT"
-      # both hosts: 'localhost' matches socket connections, '127.0.0.1' matches TCP
-      SQL=""
-      for h in localhost 127.0.0.1; do
-        SQL+="CREATE USER IF NOT EXISTS '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
-        SQL+="ALTER USER '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
-        SQL+="GRANT ${GRANTS} ON *.* TO '${BK_USER}'@'${h}';"
-      done
-      SQL+="FLUSH PRIVILEGES;"
-      if "$SQLBIN" "${ADMIN_ARGS[@]}" -e "$SQL" 2>/tmp/.mkuser.err; then
-        DB_USER="$BK_USER"; DB_PASS="$GEN_PASS"; BACKUP_USER_CREATED=1
-        ok "user '${BK_USER}' created with a random password"
-        echo "     password: ${YEL}${GEN_PASS}${NC}"
-        echo "     (saved in ${CONF_PATH}, no need to memorise it)"
-      else
-        warn "could not create the user: $(tail -c 300 /tmp/.mkuser.err)"
+  # Try, in order, every way of reaching the server as an admin without asking
+  # the user anything. On Ubuntu, root normally authenticates through the unix
+  # socket (auth_socket / unix_socket), so no password exists at all.
+  find_admin_access() {
+    local candidates=(
+      "--protocol=socket"
+      ""
+      "--defaults-file=/etc/mysql/debian.cnf"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+      [[ "$c" == "--defaults-file=/etc/mysql/debian.cnf" && ! -r /etc/mysql/debian.cnf ]] && continue
+      if [[ -z "$c" ]]; then ADMIN_ARGS=(); else ADMIN_ARGS=("$c"); fi
+      if "$SQLBIN" "${ADMIN_ARGS[@]}" -e "SELECT 1" >/dev/null 2>&1; then
+        info "admin access via ${c:-default local connection}"
+        return 0
       fi
+    done
+    # nothing worked (remote server, or root has a password) -> ask once
+    echo "Admin credentials are needed once to create the backup user."
+    echo "They are used now and never stored."
+    read -rp "  Admin user [root]: " ADM_USER; ADM_USER="${ADM_USER:-root}"
+    read -rsp "  Admin password: " ADM_PASS; echo
+    ADMIN_CNF="$(mktemp)"; chmod 600 "$ADMIN_CNF"
+    printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
+      "$ADM_USER" "$ADM_PASS" "$DB_HOST" "$DB_PORT" >"$ADMIN_CNF"
+    ADMIN_ARGS=(--defaults-extra-file="$ADMIN_CNF")
+    "$SQLBIN" "${ADMIN_ARGS[@]}" -e "SELECT 1" >/dev/null 2>&1
+  }
+
+  # Verify a user/password actually works over the connection the backup
+  # script will use, so a broken login is caught now and not at 3am.
+  db_login_works() {
+    local u="$1" p="$2" cnf rc=0
+    cnf="$(mktemp)"; chmod 600 "$cnf"
+    printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
+      "$u" "$p" "$DB_HOST" "$DB_PORT" >"$cnf"
+    "$SQLBIN" --defaults-extra-file="$cnf" -e "SELECT 1" >/dev/null 2>&1 || rc=1
+    rm -f "$cnf"
+    return $rc
+  }
+
+  create_backup_user() {
+    local BK_USER="backup" GEN_PASS SQL h hosts GRANTS
+    # 28 chars, letters+digits only so no SQL/shell quoting surprises
+    GEN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 28)"
+    # 'localhost' matches socket connections, '127.0.0.1' matches TCP;
+    # a remote server needs a wildcard host instead
+    case "$DB_HOST" in
+      localhost|127.0.0.1|::1) hosts=(localhost 127.0.0.1) ;;
+      *) hosts=('%'); warn "remote database: the user will be created as '${BK_USER}'@'%'" ;;
+    esac
+    GRANTS="SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, RELOAD, PROCESS, REPLICATION CLIENT"
+    SQL=""
+    for h in "${hosts[@]}"; do
+      SQL+="CREATE USER IF NOT EXISTS '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
+      SQL+="ALTER USER '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
+      SQL+="GRANT ${GRANTS} ON *.* TO '${BK_USER}'@'${h}';"
+    done
+    SQL+="FLUSH PRIVILEGES;"
+
+    if ! "$SQLBIN" "${ADMIN_ARGS[@]}" -e "$SQL" 2>/tmp/.mkuser.err; then
+      warn "could not create the user: $(tail -c 300 /tmp/.mkuser.err)"
       rm -f /tmp/.mkuser.err
+      return 1
+    fi
+    rm -f /tmp/.mkuser.err
+
+    if ! db_login_works "$BK_USER" "$GEN_PASS"; then
+      warn "user '${BK_USER}' was created but cannot log in on ${DB_HOST}:${DB_PORT}"
+      return 1
+    fi
+    DB_USER="$BK_USER"; DB_PASS="$GEN_PASS"; BACKUP_USER_CREATED=1
+    ok "user '${BK_USER}' created and verified (random 28-char password)"
+    echo "     the password is stored in ${CONF_PATH}, you do not need it"
+    return 0
+  }
+
+  if [[ -n "$SQLBIN" ]]; then
+    info "creating a dedicated backup user ..."
+    if find_admin_access; then
+      create_backup_user || true
     else
       warn "could not connect with those admin credentials"
     fi
     [[ -n "$ADMIN_CNF" ]] && rm -f "$ADMIN_CNF"
+  else
+    warn "no mysql client found, skipping user creation"
   fi
 
-  if [[ "$BACKUP_USER_CREATED" -eq 0 ]]; then
+  # only fall back to manual credentials if the automatic path failed
+  while [[ "$BACKUP_USER_CREATED" -eq 0 ]]; do
     echo
-    warn "no backup user was created, enter the credentials manually:"
+    warn "enter database credentials manually:"
     read -rp "MySQL user [root]: " DB_USER; DB_USER="${DB_USER:-root}"
     read -rsp "MySQL password: " DB_PASS; echo
-  fi
+    if [[ -z "$SQLBIN" ]] || db_login_works "$DB_USER" "$DB_PASS"; then
+      break
+    fi
+    warn "login failed for '${DB_USER}'@${DB_HOST}"
+    if [[ "$DB_USER" == "root" ]]; then
+      warn "on Ubuntu, root usually authenticates through the unix socket and has"
+      warn "no password, so a password login always fails (MySQL error 1698)."
+    fi
+    read -rp "Try again? [Y/n]: " a
+    [[ "${a,,}" == "n" ]] && break
+  done
 
   while [[ -z "${DATABASES:-}" ]]; do
     read -rp "Database names, comma separated (or 'all'): " DATABASES
