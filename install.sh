@@ -63,6 +63,21 @@ if [[ "$ACTION" == "uninstall" ]]; then
   rm -f "$BIN_PATH"
   ok "سرویس و اسکریپت حذف شدند"
   if [[ -f "$CONF_PATH" ]]; then
+    # shellcheck disable=SC1090
+    ( source "$CONF_PATH" >/dev/null 2>&1; echo "${DB_USER:-}" ) >/tmp/.duser
+    DUSER="$(cat /tmp/.duser)"; rm -f /tmp/.duser
+    if [[ -n "$DUSER" && "$DUSER" != "root" ]]; then
+      read -rp "کاربر دیتابیس '${DUSER}' هم از MySQL حذف شود؟ [y/N]: " a
+      if [[ "${a,,}" == "y" ]]; then
+        SQLBIN="$(command -v mysql || command -v mariadb || true)"
+        if [[ -n "$SQLBIN" ]] && "$SQLBIN" --protocol=socket -e \
+             "DROP USER IF EXISTS '${DUSER}'@'localhost'; DROP USER IF EXISTS '${DUSER}'@'127.0.0.1';" 2>/dev/null; then
+          ok "کاربر ${DUSER} حذف شد"
+        else
+          warn "حذف کاربر ناموفق بود، دستی اجرا کنید: DROP USER '${DUSER}'@'localhost';"
+        fi
+      fi
+    fi
     read -rp "فایل کانفیگ ${CONF_PATH} هم حذف شود؟ [y/N]: " a
     [[ "${a,,}" == "y" ]] && rm -f "$CONF_PATH" && ok "کانفیگ حذف شد"
   fi
@@ -89,6 +104,7 @@ echo
 
 # 1) dependencies
 info "بررسی و نصب پیش‌نیازها ..."
+export DEBIAN_FRONTEND=noninteractive
 MISSING=()
 command -v curl >/dev/null || MISSING+=(curl)
 command -v zip  >/dev/null || MISSING+=(zip)
@@ -98,11 +114,24 @@ if ! command -v mysqldump >/dev/null && ! command -v mariadb-dump >/dev/null; th
   if command -v mariadb >/dev/null; then MISSING+=(mariadb-client); else MISSING+=(mysql-client); fi
 fi
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-  export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq "${MISSING[@]}" || die "نصب پیش‌نیازها ناموفق بود: ${MISSING[*]}"
 fi
-ok "پیش‌نیازها آماده است"
+
+# 7-Zip: needed for WinRAR-style multi volume archives
+HAVE_7Z=""
+for b in 7zz 7z 7za 7zr; do command -v "$b" >/dev/null && { HAVE_7Z="$b"; break; }; done
+if [[ -z "$HAVE_7Z" ]]; then
+  info "نصب 7zip برای ساخت آرشیو چندپارتی ..."
+  apt-get update -qq
+  apt-get install -y -qq 7zip 2>/dev/null || apt-get install -y -qq p7zip-full 2>/dev/null || true
+  for b in 7zz 7z 7za 7zr; do command -v "$b" >/dev/null && { HAVE_7Z="$b"; break; }; done
+fi
+if [[ -n "$HAVE_7Z" ]]; then
+  ok "پیش‌نیازها آماده است (7z: ${HAVE_7Z})"
+else
+  warn "7zip نصب نشد؛ اسکریپت به فرمت zip برمی‌گردد که بازکردن پارت‌هایش دستی است"
+fi
 
 # 2) the script itself
 fetch_script
@@ -122,10 +151,67 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
 
   echo
   echo "--- تنظیمات دیتابیس ---"
-  read -rp "کاربر MySQL [root]: " DB_USER; DB_USER="${DB_USER:-root}"
-  read -rsp "پسورد MySQL: " DB_PASS; echo
   read -rp "هاست [127.0.0.1]: " DB_HOST; DB_HOST="${DB_HOST:-127.0.0.1}"
   read -rp "پورت [3306]: " DB_PORT; DB_PORT="${DB_PORT:-3306}"
+
+  SQLBIN="$(command -v mysql || command -v mariadb || true)"
+  BACKUP_USER_CREATED=0
+
+  echo
+  echo "کاربر backup با دسترسی محدود و پسورد تصادفی ساخته شود؟"
+  echo "(پیشنهاد می‌شود — به‌جای اینکه پسورد root را در فایل کانفیگ بگذارید)"
+  read -rp "[Y/n]: " a
+  if [[ "${a,,}" != "n" && -n "$SQLBIN" ]]; then
+    # --- find a way to talk to the server as an admin ---
+    ADMIN_CNF=""
+    if "$SQLBIN" --protocol=socket -e "SELECT 1" >/dev/null 2>&1; then
+      info "اتصال ادمین از طریق سوکت لوکال برقرار شد"
+      ADMIN_ARGS=(--protocol=socket)
+    else
+      echo "برای ساخت کاربر، یک بار مشخصات ادمین دیتابیس لازم است (جایی ذخیره نمی‌شود):"
+      read -rp "  کاربر ادمین [root]: " ADM_USER; ADM_USER="${ADM_USER:-root}"
+      read -rsp "  پسورد ادمین: " ADM_PASS; echo
+      ADMIN_CNF="$(mktemp)"; chmod 600 "$ADMIN_CNF"
+      printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
+        "$ADM_USER" "$ADM_PASS" "$DB_HOST" "$DB_PORT" >"$ADMIN_CNF"
+      ADMIN_ARGS=(--defaults-extra-file="$ADMIN_CNF")
+    fi
+
+    if "$SQLBIN" "${ADMIN_ARGS[@]}" -e "SELECT 1" >/dev/null 2>&1; then
+      # 28 chars, letters+digits only so no SQL/shell quoting surprises
+      GEN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 28)"
+      read -rp "نام کاربر [backup]: " BK_USER; BK_USER="${BK_USER:-backup}"
+      GRANTS="SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, RELOAD, PROCESS, REPLICATION CLIENT"
+      # both hosts: 'localhost' matches socket connections, '127.0.0.1' matches TCP
+      SQL=""
+      for h in localhost 127.0.0.1; do
+        SQL+="CREATE USER IF NOT EXISTS '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
+        SQL+="ALTER USER '${BK_USER}'@'${h}' IDENTIFIED BY '${GEN_PASS}';"
+        SQL+="GRANT ${GRANTS} ON *.* TO '${BK_USER}'@'${h}';"
+      done
+      SQL+="FLUSH PRIVILEGES;"
+      if "$SQLBIN" "${ADMIN_ARGS[@]}" -e "$SQL" 2>/tmp/.mkuser.err; then
+        DB_USER="$BK_USER"; DB_PASS="$GEN_PASS"; BACKUP_USER_CREATED=1
+        ok "کاربر '${BK_USER}' با پسورد تصادفی ساخته شد"
+        echo "     پسورد: ${YEL}${GEN_PASS}${NC}"
+        echo "     (در ${CONF_PATH} ذخیره می‌شود، لازم نیست حفظش کنید)"
+      else
+        warn "ساخت کاربر ناموفق بود: $(tail -c 300 /tmp/.mkuser.err)"
+      fi
+      rm -f /tmp/.mkuser.err
+    else
+      warn "اتصال با مشخصات ادمین برقرار نشد"
+    fi
+    [[ -n "$ADMIN_CNF" ]] && rm -f "$ADMIN_CNF"
+  fi
+
+  if [[ "$BACKUP_USER_CREATED" -eq 0 ]]; then
+    echo
+    warn "کاربر بکاپ ساخته نشد، مشخصات را دستی وارد کنید:"
+    read -rp "کاربر MySQL [root]: " DB_USER; DB_USER="${DB_USER:-root}"
+    read -rsp "پسورد MySQL: " DB_PASS; echo
+  fi
+
   while [[ -z "${DATABASES:-}" ]]; do
     read -rp "نام دیتابیس‌ها با کاما جدا شود (یا all برای همه): " DATABASES
   done
@@ -133,9 +219,15 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
   echo
   echo "--- تنظیمات بکاپ ---"
   read -rp "فاصله زمانی ارسال به دقیقه [60]: " INTERVAL_MIN; INTERVAL_MIN="${INTERVAL_MIN:-60}"
+  if [[ -n "$HAVE_7Z" ]]; then
+    read -rp "فرمت آرشیو، 7z (چندپارتی با یک کلیک) یا zip [7z]: " ARCHIVE_FORMAT
+    ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-7z}"
+  else
+    ARCHIVE_FORMAT="zip"
+  fi
   read -rp "حجم هر پارت [45m]: " PART_SIZE; PART_SIZE="${PART_SIZE:-45m}"
   read -rp "نگهداری بکاپ محلی چند روز؟ [3]: " KEEP_DAYS; KEEP_DAYS="${KEEP_DAYS:-3}"
-  read -rsp "پسورد فایل zip (خالی = بدون رمز): " ZIP_PASSWORD; echo
+  read -rsp "پسورد فایل آرشیو (خالی = بدون رمز): " ZIP_PASSWORD; echo
 
   umask 077
   cat >"$CONF_PATH" <<EOF
@@ -151,7 +243,9 @@ DB_HOST="${DB_HOST}"
 DB_PORT=${DB_PORT}
 
 BACKUP_DIR="${DEFAULT_BACKUP_DIR}"
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT}"
 PART_SIZE="${PART_SIZE}"
+COMPRESS_LEVEL=5
 ZIP_PASSWORD="${ZIP_PASSWORD}"
 KEEP_DAYS=${KEEP_DAYS}
 EOF

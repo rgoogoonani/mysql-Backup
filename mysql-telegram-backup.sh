@@ -18,8 +18,10 @@ DB_PASS="${DB_PASS:-}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql-tg}"
-PART_SIZE="${PART_SIZE:-45m}"           # each zip part size (keep under 50m)
-ZIP_PASSWORD="${ZIP_PASSWORD:-}"        # optional zip password
+PART_SIZE="${PART_SIZE:-45m}"           # each part size (keep under 50m)
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-7z}"  # 7z = WinRAR-style volumes | zip = plain zip
+COMPRESS_LEVEL="${COMPRESS_LEVEL:-5}"   # 0..9 for 7z
+ZIP_PASSWORD="${ZIP_PASSWORD:-}"        # optional archive password
 KEEP_DAYS="${KEEP_DAYS:-3}"             # keep local copies N days (0 = delete now)
 TG_API="${TG_API:-https://api.telegram.org}"
 
@@ -43,8 +45,9 @@ Options:
   -P, --db-port PORT       MySQL port        (default 3306)
 
   -o, --out DIR            Backup directory  (default /var/backups/mysql-tg)
-  -s, --part-size SIZE     Zip part size, e.g. 45m  (default 45m)
-  -z, --zip-pass PASS      Password protect the zip  (optional)
+  -s, --part-size SIZE     Part size, e.g. 45m  (default 45m)
+  -a, --format 7z|zip      Archive format (default 7z: WinRAR-style volumes)
+  -z, --zip-pass PASS      Password protect the archive  (optional)
   -k, --keep-days N        Keep local backups N days (default 3)
   -f, --config FILE        Read variables from a shell config file
   -h, --help               This help
@@ -70,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     -P|--db-port)    CLI[DB_PORT]="$2"; shift 2 ;;
     -o|--out)        CLI[BACKUP_DIR]="$2"; shift 2 ;;
     -s|--part-size)  CLI[PART_SIZE]="$2"; shift 2 ;;
+    -a|--format)     CLI[ARCHIVE_FORMAT]="$2"; shift 2 ;;
     -z|--zip-pass)   CLI[ZIP_PASSWORD]="$2"; shift 2 ;;
     -k|--keep-days)  CLI[KEEP_DAYS]="$2"; shift 2 ;;
     -f|--config)     CONFIG_FILE="$2"; shift 2 ;;
@@ -108,8 +112,22 @@ for b in mysqldump mariadb-dump; do
   if command -v "$b" >/dev/null 2>&1; then DUMP_BIN="$b"; break; fi
 done
 [[ -n "$DUMP_BIN" ]] || die "mysqldump not found. install with: apt install mysql-client"
-command -v zip  >/dev/null 2>&1 || die "zip not found. install with: apt install zip"
 command -v curl >/dev/null 2>&1 || die "curl not found. install with: apt install curl"
+
+# 7-Zip creates real multi-volume archives (file.7z.001, .002 ...) that WinRAR
+# and 7-Zip open with a double click on the first part — no manual rejoining.
+SEVENZIP=""
+for b in 7zz 7z 7za 7zr; do
+  if command -v "$b" >/dev/null 2>&1; then SEVENZIP="$b"; break; fi
+done
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT,,}"
+if [[ "$ARCHIVE_FORMAT" == "7z" && -z "$SEVENZIP" ]]; then
+  log "WARNING: 7z not found (apt install 7zip), falling back to zip format"
+  ARCHIVE_FORMAT="zip"
+fi
+if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
+  command -v zip >/dev/null 2>&1 || die "zip not found. install with: apt install zip"
+fi
 
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -181,6 +199,60 @@ list_all_databases() {
     | grep -Ev '^(information_schema|performance_schema|mysql|sys)$'
 }
 
+# Builds the archive and fills ARCHIVE_PARTS with the files to upload, in order.
+# 7z mode  -> base.7z            (single)   or base.7z.001, base.7z.002 ... (volumes)
+# zip mode -> base.zip           (single)   or base.zip.001.part ...        (raw split)
+ARCHIVE_PARTS=()
+create_archive() {
+  local sqlfile="$1" base="$2"
+  ARCHIVE_PARTS=()
+
+  if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
+    local args=(a -t7z "-mx=${COMPRESS_LEVEL}" "-v${PART_SIZE}" -y)
+    if [[ -n "$ZIP_PASSWORD" ]]; then
+      args+=("-p${ZIP_PASSWORD}" -mhe=on)   # -mhe also encrypts the file list
+    fi
+    local rc=0
+    ( cd "$BACKUP_DIR" && "$SEVENZIP" "${args[@]}" "${base}.7z" "$(basename "$sqlfile")" \
+        >/dev/null 2>"${sqlfile}.7z.err" ) || rc=$?
+    if [[ $rc -gt 1 ]]; then          # 0 = ok, 1 = warning, >1 = real error
+      log "7z failed (rc=$rc): $(tail -c 300 "${sqlfile}.7z.err" 2>/dev/null)"
+      rm -f "${sqlfile}.7z.err"
+      return 1
+    fi
+    rm -f "${sqlfile}.7z.err" "$sqlfile"
+
+    mapfile -t ARCHIVE_PARTS < <(find "$BACKUP_DIR" -maxdepth 1 \
+      -name "${base}.7z.[0-9][0-9][0-9]" | sort)
+    # a single volume gets renamed to plain .7z so it opens with one click
+    if [[ ${#ARCHIVE_PARTS[@]} -eq 1 ]]; then
+      mv -f "${ARCHIVE_PARTS[0]}" "${BACKUP_DIR}/${base}.7z"
+      ARCHIVE_PARTS=("${BACKUP_DIR}/${base}.7z")
+    fi
+
+  else
+    local zipargs=(-q -j)
+    [[ -n "$ZIP_PASSWORD" ]] && zipargs+=(-P "$ZIP_PASSWORD")
+    ( cd "$BACKUP_DIR" && zip "${zipargs[@]}" "${base}.zip" "$(basename "$sqlfile")" ) || return 1
+    rm -f "$sqlfile"
+    local zipfile="${BACKUP_DIR}/${base}.zip"
+    if [[ "$(stat -c%s "$zipfile")" -gt "$PART_BYTES" ]]; then
+      split -b "$PART_BYTES" -d -a 3 --numeric-suffixes=1 \
+            --additional-suffix=.part "$zipfile" "${zipfile}."
+      rm -f "$zipfile"
+      mapfile -t ARCHIVE_PARTS < <(find "$BACKUP_DIR" -maxdepth 1 \
+        -name "${base}.zip.*.part" | sort)
+    else
+      ARCHIVE_PARTS=("$zipfile")
+    fi
+  fi
+
+  local total=0 f
+  for f in "${ARCHIVE_PARTS[@]}"; do total=$(( total + $(stat -c%s "$f") )); done
+  log "archive: ${#ARCHIVE_PARTS[@]} file(s), $(numfmt --to=iec "$total") total"
+  return 0
+}
+
 backup_one_db() {
   local db="$1"
   local ts base sqlfile parts n i sizeb
@@ -202,29 +274,12 @@ backup_one_db() {
   [[ "$sizeb" -gt 0 ]] || { log "empty dump for $db"; rm -f "$sqlfile"; return 1; }
   log "dump size: $(numfmt --to=iec "$sizeb")"
 
-  # compress
-  local zipargs=(-q -j)
-  [[ -n "$ZIP_PASSWORD" ]] && zipargs+=(-P "$ZIP_PASSWORD")
-  ( cd "$BACKUP_DIR" && zip "${zipargs[@]}" "${base}.zip" "$(basename "$sqlfile")" )
-  rm -f "$sqlfile"
-
-  local zipfile="${BACKUP_DIR}/${base}.zip"
-  local zipsize
-  zipsize=$(stat -c%s "$zipfile")
-  log "zip size: $(numfmt --to=iec "$zipsize")"
-
-  # split only when the archive is bigger than one Telegram part
-  if [[ "$zipsize" -gt "$PART_BYTES" ]]; then
-    split -b "$PART_BYTES" -d -a 3 --numeric-suffixes=1 \
-          --additional-suffix=.part "$zipfile" "${zipfile}."
-    rm -f "$zipfile"
-    mapfile -t parts < <(find "$BACKUP_DIR" -maxdepth 1 -name "${base}.zip.*.part" | sort)
-  else
-    parts=("$zipfile")
-  fi
+  # compress (fills the global ARCHIVE_PARTS array)
+  create_archive "$sqlfile" "$base" || { log "compression failed for $db"; return 1; }
+  parts=("${ARCHIVE_PARTS[@]}")
 
   n="${#parts[@]}"
-  [[ "$n" -gt 0 ]] || { log "zip produced nothing for $db"; return 1; }
+  [[ "$n" -gt 0 ]] || { log "archiving produced nothing for $db"; return 1; }
 
   i=0
   for p in "${parts[@]}"; do
@@ -249,14 +304,15 @@ backup_one_db() {
   done
 
   if [[ "$n" -gt 1 ]]; then
-    tg_send_text "ℹ️ ${db} (${ts}) was sent in ${n} parts.
+    if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
+      tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
+همه پارت‌ها را در یک پوشه دانلود کنید، بعد روی ${base}.7z.001 راست‌کلیک کنید و Extract Here بزنید (WinRAR یا 7-Zip). بقیه پارت‌ها خودکار خوانده می‌شوند.
+Linux: 7z x ${base}.7z.001"
+    else
+      tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
 Download all parts into one folder, then:
-
-Linux/macOS:
-cat ${base}.zip.*.part > ${base}.zip && unzip ${base}.zip
-
-Windows (cmd):
-copy /b ${base}.zip.001.part+${base}.zip.002.part ... ${base}.zip"
+cat ${base}.zip.*.part > ${base}.zip && unzip ${base}.zip"
+    fi
   fi
 
   log "database $db done ($n file(s))"
@@ -264,11 +320,11 @@ copy /b ${base}.zip.001.part+${base}.zip.002.part ... ${base}.zip"
 }
 
 prune_old() {
+  local pat=(-name '*.zip' -o -name '*.part' -o -name '*.7z' -o -name '*.7z.[0-9][0-9][0-9]')
   if [[ "$KEEP_DAYS" == "0" ]]; then
-    find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.zip' -o -name '*.part' \) -delete
+    find "$BACKUP_DIR" -maxdepth 1 -type f \( "${pat[@]}" \) -delete
   else
-    find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.zip' -o -name '*.part' \) \
-      -mtime +"$KEEP_DAYS" -delete
+    find "$BACKUP_DIR" -maxdepth 1 -type f \( "${pat[@]}" \) -mtime +"$KEEP_DAYS" -delete
   fi
 }
 
