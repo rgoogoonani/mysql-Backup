@@ -195,7 +195,7 @@ if [[ -f "$CONF_PATH" ]]; then
   read -rp "A config already exists. Overwrite it? [y/N]: " a
   [[ "${a,,}" == "y" ]] || { info "keeping the existing config"; SKIP_CONF=1; }
   if [[ -n "${SKIP_CONF:-}" && -n "$PROXY" ]] && ! grep -q '^PROXY=' "$CONF_PATH"; then
-    printf '\nPROXY="%s"\n' "$PROXY" >>"$CONF_PATH"
+    printf '\nPROXY=%q\n' "$PROXY" >>"$CONF_PATH"
     ok "PROXY line added to the existing config"
   fi
 fi
@@ -342,27 +342,30 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
   read -rsp "Archive password (empty = no password): " ZIP_PASSWORD; echo
 
   umask 077
-  cat >"$CONF_PATH" <<EOF
-# mysql-telegram-backup config — generated $(date '+%Y-%m-%d %H:%M:%S')
-BOT_TOKEN="${BOT_TOKEN}"
-CHAT_ID="${CHAT_ID}"
-# proxy for reaching Telegram: http://host:port or socks5h://host:port
-PROXY="${PROXY}"
-DATABASES="${DATABASES}"
-INTERVAL_MIN=${INTERVAL_MIN}
-
-DB_USER="${DB_USER}"
-DB_PASS="${DB_PASS}"
-DB_HOST="${DB_HOST}"
-DB_PORT=${DB_PORT}
-
-BACKUP_DIR="${DEFAULT_BACKUP_DIR}"
-ARCHIVE_FORMAT="${ARCHIVE_FORMAT}"
-PART_SIZE="${PART_SIZE}"
-COMPRESS_LEVEL=5
-ZIP_PASSWORD="${ZIP_PASSWORD}"
-KEEP_DAYS=${KEEP_DAYS}
-EOF
+  # Values are written with printf %q, so passwords containing $ ` " ' or a
+  # backslash are stored literally instead of being expanded when the config
+  # is sourced.
+  {
+    echo "# mysql-telegram-backup config - generated $(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'BOT_TOKEN=%q\n' "$BOT_TOKEN"
+    printf 'CHAT_ID=%q\n'   "$CHAT_ID"
+    echo "# proxy for reaching Telegram: http://host:port or socks5h://host:port"
+    printf 'PROXY=%q\n'     "$PROXY"
+    printf 'DATABASES=%q\n' "$DATABASES"
+    printf 'INTERVAL_MIN=%q\n' "$INTERVAL_MIN"
+    echo
+    printf 'DB_USER=%q\n' "$DB_USER"
+    printf 'DB_PASS=%q\n' "$DB_PASS"
+    printf 'DB_HOST=%q\n' "$DB_HOST"
+    printf 'DB_PORT=%q\n' "$DB_PORT"
+    echo
+    printf 'BACKUP_DIR=%q\n'     "$DEFAULT_BACKUP_DIR"
+    printf 'ARCHIVE_FORMAT=%q\n' "$ARCHIVE_FORMAT"
+    printf 'PART_SIZE=%q\n'      "$PART_SIZE"
+    echo 'COMPRESS_LEVEL=5'
+    printf 'ZIP_PASSWORD=%q\n'   "$ZIP_PASSWORD"
+    printf 'KEEP_DAYS=%q\n'      "$KEEP_DAYS"
+  } >"$CONF_PATH"
   chmod 600 "$CONF_PATH"
   ok "config saved to ${CONF_PATH} (readable by root only)"
 
