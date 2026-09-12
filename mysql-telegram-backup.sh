@@ -328,7 +328,7 @@ backup_one_db() {
   if [[ "$n" -gt 1 ]]; then
     if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
       tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
-همه پارت‌ها را در یک پوشه دانلود کنید، بعد روی ${base}.7z.001 راست‌کلیک کنید و Extract Here بزنید (WinRAR یا 7-Zip). بقیه پارت‌ها خودکار خوانده می‌شوند.
+Download every part into the same folder, then right-click ${base}.7z.001 and choose Extract Here (WinRAR or 7-Zip). The other parts are picked up automatically.
 Linux: 7z x ${base}.7z.001"
     else
       tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
