@@ -17,6 +17,9 @@ SERVICE_NAME="mysql-tg-backup"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_BACKUP_DIR="/var/backups/mysql-tg"
 
+PROXY="${PROXY:-}"
+CURL_PROXY=()
+
 GREEN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m'; BLU=$'\e[34m'; NC=$'\e[0m'
 ok()   { echo "${GREEN}[ OK ]${NC} $*"; }
 info() { echo "${BLU}[ .. ]${NC} $*"; }
@@ -44,7 +47,7 @@ fetch_script() {
     local branch
     for branch in main master; do
       info "دانلود اسکریپت از شاخه ${branch} ..."
-      if curl -fsSL --max-time 60 "${REPO_RAW}/${branch}/${SCRIPT_NAME}" -o /tmp/${SCRIPT_NAME}.dl; then
+      if curl -fsSL --max-time 60 "${CURL_PROXY[@]}" "${REPO_RAW}/${branch}/${SCRIPT_NAME}" -o /tmp/${SCRIPT_NAME}.dl; then
         install -m 750 /tmp/${SCRIPT_NAME}.dl "$BIN_PATH"
         rm -f /tmp/${SCRIPT_NAME}.dl
         break
@@ -90,6 +93,11 @@ fi
 
 # ------------------------------------------------------------------- update --
 if [[ "$ACTION" == "update" ]]; then
+  if [[ -f "$CONF_PATH" ]]; then
+    # shellcheck disable=SC1090
+    PROXY="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${PROXY:-}")"
+    [[ -n "$PROXY" ]] && CURL_PROXY=(--proxy "$PROXY") && info "استفاده از پروکسی ذخیره‌شده"
+  fi
   fetch_script
   systemctl restart "$SERVICE_NAME" 2>/dev/null && ok "سرویس ری‌استارت شد" || true
   exit 0
@@ -101,6 +109,48 @@ echo "==================================================="
 echo "   نصب MySQL Telegram Backup"
 echo "==================================================="
 echo
+
+# ---------------------------------------------------------------- 0) proxy ---
+# Telegram (and sometimes GitHub) is blocked in Iran, so everything this
+# installer downloads or sends can go through a proxy.
+ask_proxy() {
+  echo "--- پروکسی ---"
+  echo "تلگرام در ایران فیلتر است. اگر سرور مستقیم به تلگرام دسترسی ندارد،"
+  echo "اینجا پروکسی بدهید (مثلاً همان Xray/V2Ray لوکال روی سرور)."
+  echo "  1) بدون پروکسی"
+  echo "  2) HTTP"
+  echo "  3) SOCKS5"
+  read -rp "انتخاب [1]: " pchoice; pchoice="${pchoice:-1}"
+  case "$pchoice" in
+    2) PSCHEME="http" ;;
+    3) PSCHEME="socks5h" ;;   # h = DNS از سمت پروکسی حل شود
+    *) PROXY=""; CURL_PROXY=(); return 0 ;;
+  esac
+  local dh="127.0.0.1" dp
+  [[ "$PSCHEME" == "http" ]] && dp=8118 || dp=10808
+  read -rp "  آدرس/آی‌پی پروکسی [${dh}]: " PHOST; PHOST="${PHOST:-$dh}"
+  read -rp "  پورت [${dp}]: " PPORT; PPORT="${PPORT:-$dp}"
+  read -rp "  یوزرنیم (اگر ندارد Enter): " PUSER
+  if [[ -n "$PUSER" ]]; then
+    read -rsp "  پسورد: " PPASS; echo
+    PROXY="${PSCHEME}://${PUSER}:${PPASS}@${PHOST}:${PPORT}"
+  else
+    PROXY="${PSCHEME}://${PHOST}:${PPORT}"
+  fi
+  CURL_PROXY=(--proxy "$PROXY")
+  info "تست پروکسی ..."
+  if curl -sS --max-time 20 "${CURL_PROXY[@]}" -o /dev/null https://api.telegram.org; then
+    ok "پروکسی کار می‌کند و api.telegram.org در دسترس است"
+  else
+    warn "از طریق این پروکسی به تلگرام نرسیدیم. می‌توانید ادامه دهید و بعداً"
+    warn "مقدار PROXY را در ${CONF_PATH} اصلاح کنید."
+    read -rp "ادامه می‌دهید؟ [Y/n]: " a
+    [[ "${a,,}" == "n" ]] && exit 1
+  fi
+  echo
+}
+
+ask_proxy
 
 # 1) dependencies
 info "بررسی و نصب پیش‌نیازها ..."
@@ -141,6 +191,10 @@ if [[ -f "$CONF_PATH" ]]; then
   echo
   read -rp "فایل کانفیگ از قبل وجود دارد. بازنویسی شود؟ [y/N]: " a
   [[ "${a,,}" == "y" ]] || { info "کانفیگ قبلی حفظ شد"; SKIP_CONF=1; }
+  if [[ -n "${SKIP_CONF:-}" && -n "$PROXY" ]] && ! grep -q '^PROXY=' "$CONF_PATH"; then
+    printf '\nPROXY="%s"\n' "$PROXY" >>"$CONF_PATH"
+    ok "خط PROXY به کانفیگ قبلی اضافه شد"
+  fi
 fi
 
 if [[ -z "${SKIP_CONF:-}" ]]; then
@@ -234,6 +288,8 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
 # mysql-telegram-backup config — generated $(date '+%Y-%m-%d %H:%M:%S')
 BOT_TOKEN="${BOT_TOKEN}"
 CHAT_ID="${CHAT_ID}"
+# proxy for reaching Telegram: http://host:port or socks5h://host:port
+PROXY="${PROXY}"
 DATABASES="${DATABASES}"
 INTERVAL_MIN=${INTERVAL_MIN}
 
@@ -267,7 +323,7 @@ EOF
 
   # telegram test
   info "ارسال پیام تست به تلگرام ..."
-  if curl -sS --max-time 30 -o /dev/null -f \
+  if curl -sS --max-time 30 "${CURL_PROXY[@]}" -o /dev/null -f \
        -F "chat_id=${CHAT_ID}" \
        -F "text=✅ MySQL Telegram Backup روی $(hostname) نصب شد." \
        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"; then

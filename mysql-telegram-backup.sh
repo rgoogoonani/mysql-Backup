@@ -24,6 +24,11 @@ COMPRESS_LEVEL="${COMPRESS_LEVEL:-5}"   # 0..9 for 7z
 ZIP_PASSWORD="${ZIP_PASSWORD:-}"        # optional archive password
 KEEP_DAYS="${KEEP_DAYS:-3}"             # keep local copies N days (0 = delete now)
 TG_API="${TG_API:-https://api.telegram.org}"
+# Telegram is blocked in some countries. Give a proxy the server can reach:
+#   http://127.0.0.1:8118            http proxy
+#   http://user:pass@1.2.3.4:8080    http proxy with auth
+#   socks5h://127.0.0.1:10808        socks5 (h = DNS resolved by the proxy)
+PROXY="${PROXY:-}"
 
 # ------------------------------------------------------------------- utils ---
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
@@ -49,12 +54,13 @@ Options:
   -a, --format 7z|zip      Archive format (default 7z: WinRAR-style volumes)
   -z, --zip-pass PASS      Password protect the archive  (optional)
   -k, --keep-days N        Keep local backups N days (default 3)
+  -x, --proxy URL          Proxy for Telegram, http://.. or socks5h://..
   -f, --config FILE        Read variables from a shell config file
   -h, --help               This help
 
 Every option can also be given as an environment variable:
 BOT_TOKEN CHAT_ID DATABASES INTERVAL_MIN DB_USER DB_PASS DB_HOST DB_PORT
-BACKUP_DIR PART_SIZE ZIP_PASSWORD KEEP_DAYS
+BACKUP_DIR PART_SIZE ARCHIVE_FORMAT ZIP_PASSWORD KEEP_DAYS PROXY TG_API
 EOF
 }
 
@@ -76,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     -a|--format)     CLI[ARCHIVE_FORMAT]="$2"; shift 2 ;;
     -z|--zip-pass)   CLI[ZIP_PASSWORD]="$2"; shift 2 ;;
     -k|--keep-days)  CLI[KEEP_DAYS]="$2"; shift 2 ;;
+    -x|--proxy)      CLI[PROXY]="$2"; shift 2 ;;
     -f|--config)     CONFIG_FILE="$2"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
     *) die "unknown option: $1 (use --help)" ;;
@@ -139,6 +146,21 @@ if [[ "$PART_BYTES" -gt 49000000 ]]; then
   log "WARNING: part size $PART_SIZE is close to / above Telegram's 50MB bot limit"
 fi
 
+# proxy for every Telegram request
+CURL_PROXY=()
+if [[ -n "$PROXY" ]]; then
+  case "$PROXY" in
+    http://*|https://*|socks5://*|socks5h://*|socks4://*|socks4a://*) ;;
+    *) die "invalid proxy: $PROXY (must start with http:// or socks5h://)" ;;
+  esac
+  CURL_PROXY=(--proxy "$PROXY")
+  log "using proxy: ${PROXY%%:*}://...${PROXY##*@}"
+  curl -sS --max-time 25 "${CURL_PROXY[@]}" -o /dev/null \
+       "${TG_API}/bot${BOT_TOKEN}/getMe" \
+    && log "telegram reachable through the proxy" \
+    || log "WARNING: could not reach Telegram through the proxy yet"
+fi
+
 # credentials go into a 0600 temp file so they never show up in `ps`
 MYCNF="$(mktemp)"
 chmod 600 "$MYCNF"
@@ -168,7 +190,7 @@ tg_send_file() {
   local attempt
   for attempt in 1 2 3; do
     body="$(mktemp)"
-    code="$(curl -sS --max-time 600 \
+    code="$(curl -sS --max-time 900 "${CURL_PROXY[@]}" \
               -o "$body" -w '%{http_code}' \
               -F "chat_id=${CHAT_ID}" \
               -F "caption=${caption}" \
@@ -185,7 +207,7 @@ tg_send_file() {
 }
 
 tg_send_text() {
-  curl -sS --max-time 60 -o /dev/null \
+  curl -sS --max-time 60 "${CURL_PROXY[@]}" -o /dev/null \
     -F "chat_id=${CHAT_ID}" -F "text=$1" \
     "${TG_API}/bot${BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }
