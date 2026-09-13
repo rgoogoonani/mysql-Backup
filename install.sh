@@ -19,12 +19,15 @@ DEFAULT_BACKUP_DIR="/var/backups/mysql-tg"
 
 PROXY="${PROXY:-}"
 CURL_PROXY=()
+MESSENGER="${MESSENGER:-telegram}"      # telegram or bale (asked below)
 
 GREEN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m'; BLU=$'\e[34m'; NC=$'\e[0m'
 ok()   { echo "${GREEN}[ OK ]${NC} $*"; }
 info() { echo "${BLU}[ .. ]${NC} $*"; }
 warn() { echo "${YEL}[WARN]${NC} $*"; }
 die()  { echo "${RED}[FAIL]${NC} $*" >&2; exit 1; }
+# Bale (https://bale.ai) shares Telegram's bot API, only the host differs.
+messenger_api() { case "$MESSENGER" in bale) echo "https://tapi.bale.ai" ;; *) echo "https://api.telegram.org" ;; esac; }
 
 [[ $EUID -eq 0 ]] || die "this installer must run as root:  sudo bash install.sh"
 
@@ -109,16 +112,33 @@ fi
 # ------------------------------------------------------------------ install --
 echo
 echo "==================================================="
-echo "   MySQL Telegram Backup — installer"
+echo "   MySQL → Telegram / Bale Backup — installer"
 echo "==================================================="
 echo
 
-# ---------------------------------------------------------------- 0) proxy ---
+# --------------------------------------------------------- 0a) messenger ---
+# Ask first where backups should be sent: Telegram or Bale. This also decides
+# which API host is tested for the proxy below.
+echo "--- Messenger ---"
+echo "Where should the backups be sent?"
+echo "  1) Telegram"
+echo "  2) Bale (بله)"
+read -rp "Choice [1]: " mchoice; mchoice="${mchoice:-1}"
+case "$mchoice" in 2) MESSENGER="bale" ;; *) MESSENGER="telegram" ;; esac
+ok "messenger: ${MESSENGER}"
+echo
+
+# --------------------------------------------------------- 0b) proxy ---
 # Telegram (and sometimes GitHub) is blocked in Iran, so everything this
-# installer downloads or sends can go through a proxy.
+# installer downloads or sends can go through a proxy. Bale is not blocked
+# in Iran, so a proxy is usually unnecessary for it.
 ask_proxy() {
+  local api; api="$(messenger_api)"
   echo "--- Proxy ---"
-  echo "If this server cannot reach api.telegram.org directly, set a proxy"
+  if [[ "$MESSENGER" == "bale" ]]; then
+    echo "Bale is reachable from inside Iran without a proxy — usually pick 1."
+  fi
+  echo "If this server cannot reach ${api} directly, set a proxy"
   echo "here (for example a local Xray/V2Ray client running on this server)."
   echo "  1) No proxy"
   echo "  2) HTTP"
@@ -142,10 +162,10 @@ ask_proxy() {
   fi
   CURL_PROXY=(--proxy "$PROXY")
   info "testing the proxy ..."
-  if curl -sS --max-time 20 "${CURL_PROXY[@]}" -o /dev/null https://api.telegram.org; then
-    ok "proxy works, api.telegram.org is reachable"
+  if curl -sS --max-time 20 "${CURL_PROXY[@]}" -o /dev/null "$api"; then
+    ok "proxy works, ${api} is reachable"
   else
-    warn "Telegram was not reachable through this proxy. You can continue and"
+    warn "${MESSENGER} was not reachable through this proxy. You can continue and"
     warn "fix the PROXY value in ${CONF_PATH} later."
     read -rp "Continue anyway? [Y/n]: " a
     [[ "${a,,}" == "n" ]] && exit 1
@@ -202,12 +222,45 @@ fi
 
 if [[ -z "${SKIP_CONF:-}" ]]; then
   echo
-  echo "--- Telegram ---"
+  echo "--- ${MESSENGER^} bot ---"
   while [[ -z "${BOT_TOKEN:-}" ]]; do read -rp "Bot token: " BOT_TOKEN; done
   while [[ -z "${CHAT_ID:-}"   ]]; do read -rp "Destination chat id (a number, channels start with -100): " CHAT_ID; done
 
   echo
   echo "--- Database ---"
+  echo "What do you want to back up?"
+  echo "  1) MySQL / MariaDB"
+  echo "  2) SQLite (file based)"
+  read -rp "Choice [1]: " dbchoice; dbchoice="${dbchoice:-1}"
+  case "$dbchoice" in 2) DB_ENGINE="sqlite" ;; *) DB_ENGINE="mysql" ;; esac
+
+if [[ "$DB_ENGINE" == "sqlite" ]]; then
+  # ---- SQLite / file-based: just collect the file paths; they are zipped as-is.
+  # One database can be several files, so accept as many paths as needed.
+  echo
+  echo "Enter the path to each file you want to back up, one per line."
+  echo "A single database can be several files — add every file it uses."
+  echo "The files are zipped exactly as they are. Press Enter on an empty line to finish."
+  SQLITE_FILES=""
+  while true; do
+    read -rp "  File path (empty to finish): " sf
+    sf="$(echo "$sf" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$sf" ]] && break
+    if [[ -e "$sf" ]]; then
+      ok "found: $sf"
+    else
+      warn "not found: $sf"
+      read -rp "  add it anyway? [y/N]: " a
+      [[ "${a,,}" == "y" ]] || continue
+    fi
+    # paths are stored comma separated, so a path itself may not contain a comma
+    case "$sf" in *,*) warn "this path contains a comma and may not be read back correctly: $sf" ;; esac
+    [[ -n "$SQLITE_FILES" ]] && SQLITE_FILES="${SQLITE_FILES},${sf}" || SQLITE_FILES="$sf"
+  done
+  [[ -n "$SQLITE_FILES" ]] || die "no files were given"
+  ok "will back up: ${SQLITE_FILES}"
+else
+  # ---- MySQL / MariaDB
   read -rp "Host [127.0.0.1]: " DB_HOST; DB_HOST="${DB_HOST:-127.0.0.1}"
   read -rp "Port [3306]: " DB_PORT; DB_PORT="${DB_PORT:-3306}"
 
@@ -327,6 +380,7 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
   while [[ -z "${DATABASES:-}" ]]; do
     read -rp "Database names, comma separated (or 'all'): " DATABASES
   done
+fi   # end MySQL / SQLite branch
 
   echo
   echo "--- Backup ---"
@@ -347,18 +401,28 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
   # is sourced.
   {
     echo "# mysql-telegram-backup config - generated $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "# messenger: telegram or bale (bale uses https://tapi.bale.ai)"
+    printf 'MESSENGER=%q\n' "$MESSENGER"
+    printf 'DB_ENGINE=%q\n' "$DB_ENGINE"
     printf 'BOT_TOKEN=%q\n' "$BOT_TOKEN"
     printf 'CHAT_ID=%q\n'   "$CHAT_ID"
-    echo "# proxy for reaching Telegram: http://host:port or socks5h://host:port"
+    echo "# proxy for reaching the messenger: http://host:port or socks5h://host:port"
     printf 'PROXY=%q\n'     "$PROXY"
-    printf 'DATABASES=%q\n' "$DATABASES"
+    if [[ "$DB_ENGINE" == "sqlite" ]]; then
+      echo "# comma separated SQLite database file paths"
+      printf 'SQLITE_FILES=%q\n' "$SQLITE_FILES"
+    else
+      printf 'DATABASES=%q\n' "$DATABASES"
+    fi
     printf 'INTERVAL_MIN=%q\n' "$INTERVAL_MIN"
     echo
-    printf 'DB_USER=%q\n' "$DB_USER"
-    printf 'DB_PASS=%q\n' "$DB_PASS"
-    printf 'DB_HOST=%q\n' "$DB_HOST"
-    printf 'DB_PORT=%q\n' "$DB_PORT"
-    echo
+    if [[ "$DB_ENGINE" != "sqlite" ]]; then
+      printf 'DB_USER=%q\n' "$DB_USER"
+      printf 'DB_PASS=%q\n' "$DB_PASS"
+      printf 'DB_HOST=%q\n' "$DB_HOST"
+      printf 'DB_PORT=%q\n' "$DB_PORT"
+      echo
+    fi
     printf 'BACKUP_DIR=%q\n'     "$DEFAULT_BACKUP_DIR"
     printf 'ARCHIVE_FORMAT=%q\n' "$ARCHIVE_FORMAT"
     printf 'PART_SIZE=%q\n'      "$PART_SIZE"
@@ -369,25 +433,37 @@ if [[ -z "${SKIP_CONF:-}" ]]; then
   chmod 600 "$CONF_PATH"
   ok "config saved to ${CONF_PATH} (readable by root only)"
 
-  # connection test
-  info "testing the database connection ..."
-  TMPCNF="$(mktemp)"; chmod 600 "$TMPCNF"
-  printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
-    "$DB_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" >"$TMPCNF"
-  SQLBIN="$(command -v mysql || command -v mariadb || true)"
-  if [[ -n "$SQLBIN" ]] && "$SQLBIN" --defaults-extra-file="$TMPCNF" -e "SELECT 1;" >/dev/null 2>&1; then
-    ok "database connection works"
+  # connection / file test
+  if [[ "$DB_ENGINE" == "sqlite" ]]; then
+    info "checking the SQLite files ..."
+    miss=0
+    IFS=',' read -r -a _sfiles <<<"$SQLITE_FILES"
+    for _sf in "${_sfiles[@]}"; do
+      _sf="$(echo "$_sf" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      [[ -z "$_sf" ]] && continue
+      if [[ -e "$_sf" ]]; then ok "found: $_sf"; else warn "missing: $_sf"; miss=1; fi
+    done
+    [[ "$miss" -eq 0 ]] || warn "some files are missing; fix SQLITE_FILES in ${CONF_PATH}."
   else
-    warn "database connection failed. fix the user/password in ${CONF_PATH}."
+    info "testing the database connection ..."
+    TMPCNF="$(mktemp)"; chmod 600 "$TMPCNF"
+    printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
+      "$DB_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" >"$TMPCNF"
+    SQLBIN="$(command -v mysql || command -v mariadb || true)"
+    if [[ -n "$SQLBIN" ]] && "$SQLBIN" --defaults-extra-file="$TMPCNF" -e "SELECT 1;" >/dev/null 2>&1; then
+      ok "database connection works"
+    else
+      warn "database connection failed. fix the user/password in ${CONF_PATH}."
+    fi
+    rm -f "$TMPCNF"
   fi
-  rm -f "$TMPCNF"
 
-  # telegram test
-  info "sending a test message to Telegram ..."
+  # messenger test
+  info "sending a test message to ${MESSENGER} ..."
   if curl -sS --max-time 30 "${CURL_PROXY[@]}" -o /dev/null -f \
        -F "chat_id=${CHAT_ID}" \
-       -F "text=✅ MySQL Telegram Backup installed on $(hostname)" \
-       "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"; then
+       -F "text=✅ MySQL backup installed on $(hostname)" \
+       "$(messenger_api)/bot${BOT_TOKEN}/sendMessage"; then
     ok "test message sent"
   else
     warn "test message failed. check the token/chat id, and make sure you pressed Start in the bot."
@@ -398,7 +474,7 @@ fi
 info "creating the systemd service ..."
 cat >"$SERVICE_PATH" <<EOF
 [Unit]
-Description=MySQL backup to Telegram
+Description=MySQL backup to Telegram/Bale
 After=network-online.target mysql.service mariadb.service
 Wants=network-online.target
 

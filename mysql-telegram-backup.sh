@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # mysql-telegram-backup.sh
-# Dump MySQL/MariaDB databases -> zip (auto-split) -> send to a Telegram chat.
+# Dump MySQL/MariaDB (or zip given SQLite/files) -> auto-split -> send to a
+# Telegram or Bale chat.
 # Tested on Ubuntu 24.04. Requires: mysqldump (mysql-client), zip, curl.
 #
 # Usage examples at the bottom of this file (--help).
@@ -9,9 +10,15 @@
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------- defaults ---
+# Bale (https://bale.ai) is an Iranian messenger with the exact same bot API as
+# Telegram, only a different host. Pick the target here; the token/chat id are
+# whatever that messenger's BotFather-equivalent gave you.
+MESSENGER="${MESSENGER:-}"              # telegram (default) or bale
 BOT_TOKEN="${BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-}"
-DATABASES="${DATABASES:-}"              # comma separated, or "all"
+DB_ENGINE="${DB_ENGINE:-}"              # mysql (default) or sqlite
+DATABASES="${DATABASES:-}"              # comma separated, or "all"   (mysql engine)
+SQLITE_FILES="${SQLITE_FILES:-}"        # comma separated file paths  (sqlite engine)
 INTERVAL_MIN="${INTERVAL_MIN:-0}"       # 0 = run once and exit
 DB_USER="${DB_USER:-root}"
 DB_PASS="${DB_PASS:-}"
@@ -23,7 +30,7 @@ ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-7z}"  # 7z = WinRAR-style volumes | zip = plai
 COMPRESS_LEVEL="${COMPRESS_LEVEL:-5}"   # 0..9 for 7z
 ZIP_PASSWORD="${ZIP_PASSWORD:-}"        # optional archive password
 KEEP_DAYS="${KEEP_DAYS:-3}"             # keep local copies N days (0 = delete now)
-TG_API="${TG_API:-https://api.telegram.org}"
+TG_API="${TG_API:-}"                    # custom endpoint / reverse proxy; else derived from MESSENGER
 # Telegram is blocked in some countries. Give a proxy the server can reach:
 #   http://127.0.0.1:8118            http proxy
 #   http://user:pass@1.2.3.4:8080    http proxy with auth
@@ -33,15 +40,20 @@ PROXY="${PROXY:-}"
 # ------------------------------------------------------------------- utils ---
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
+# trim leading/trailing whitespace without mangling spaces inside the value
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
 usage() {
   cat <<'EOF'
 mysql-telegram-backup.sh
 
 Options:
-  -t, --token TOKEN        Telegram bot token            (required)
+  -g, --messenger NAME     Send with telegram (default) or bale
+  -t, --token TOKEN        Bot token                     (required)
   -c, --chat-id ID         Destination chat id           (required)
-  -d, --databases LIST     Comma separated db names, or "all"   (required)
+  -e, --engine ENGINE      What to back up: mysql (default) or sqlite
+  -d, --databases LIST     Comma separated db names, or "all"  (mysql engine)
+      --sqlite-files LIST  Comma separated SQLite file paths   (sqlite engine)
   -m, --minutes N          Send every N minutes. 0 = run once   (default 0)
 
   -u, --db-user USER       MySQL user        (default root)
@@ -54,13 +66,14 @@ Options:
   -a, --format 7z|zip      Archive format (default 7z: WinRAR-style volumes)
   -z, --zip-pass PASS      Password protect the archive  (optional)
   -k, --keep-days N        Keep local backups N days (default 3)
-  -x, --proxy URL          Proxy for Telegram, http://.. or socks5h://..
+  -x, --proxy URL          Proxy for the messenger, http://.. or socks5h://..
   -f, --config FILE        Read variables from a shell config file
   -h, --help               This help
 
 Every option can also be given as an environment variable:
-BOT_TOKEN CHAT_ID DATABASES INTERVAL_MIN DB_USER DB_PASS DB_HOST DB_PORT
-BACKUP_DIR PART_SIZE ARCHIVE_FORMAT ZIP_PASSWORD KEEP_DAYS PROXY TG_API
+MESSENGER BOT_TOKEN CHAT_ID DB_ENGINE DATABASES SQLITE_FILES INTERVAL_MIN DB_USER
+DB_PASS DB_HOST DB_PORT BACKUP_DIR PART_SIZE ARCHIVE_FORMAT ZIP_PASSWORD KEEP_DAYS
+PROXY TG_API
 EOF
 }
 
@@ -69,9 +82,12 @@ CONFIG_FILE=""
 declare -A CLI=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -g|--messenger)  CLI[MESSENGER]="$2"; shift 2 ;;
     -t|--token)      CLI[BOT_TOKEN]="$2"; shift 2 ;;
     -c|--chat-id)    CLI[CHAT_ID]="$2"; shift 2 ;;
     -d|--databases)  CLI[DATABASES]="$2"; shift 2 ;;
+    -e|--engine)     CLI[DB_ENGINE]="$2"; shift 2 ;;
+    --sqlite-files)  CLI[SQLITE_FILES]="$2"; shift 2 ;;
     -m|--minutes)    CLI[INTERVAL_MIN]="$2"; shift 2 ;;
     -u|--db-user)    CLI[DB_USER]="$2"; shift 2 ;;
     -p|--db-pass)    CLI[DB_PASS]="$2"; shift 2 ;;
@@ -99,27 +115,66 @@ for k in "${!CLI[@]}"; do printf -v "$k" '%s' "${CLI[$k]}"; done
 
 # ------------------------------------------------------- interactive prompt ---
 if [[ -t 0 ]]; then   # only ask when running in a terminal, never under systemd
-  [[ -z "$BOT_TOKEN" ]] && read -rp "Telegram bot token: " BOT_TOKEN
+  if [[ -z "$MESSENGER" ]]; then
+    echo "Which messenger should receive the backups?"
+    echo "  1) Telegram"
+    echo "  2) Bale"
+    read -rp "Choice [1]: " _msg
+    case "${_msg:-1}" in 2|bale|Bale) MESSENGER="bale" ;; *) MESSENGER="telegram" ;; esac
+  fi
+  [[ -z "$BOT_TOKEN" ]] && read -rp "${MESSENGER^} bot token: " BOT_TOKEN
   [[ -z "$CHAT_ID"   ]] && read -rp "Destination chat id: " CHAT_ID
-  [[ -z "$DATABASES" ]] && read -rp "Database name(s), comma separated (or 'all'): " DATABASES
+  if [[ -z "$DB_ENGINE" ]]; then
+    echo "What do you want to back up?"
+    echo "  1) MySQL / MariaDB"
+    echo "  2) SQLite (file based)"
+    read -rp "Choice [1]: " _eng
+    case "${_eng:-1}" in 2|sqlite|SQLite) DB_ENGINE="sqlite" ;; *) DB_ENGINE="mysql" ;; esac
+  fi
+  if [[ "${DB_ENGINE,,}" == "sqlite" ]]; then
+    # one database can be several files -> accept a comma separated list
+    [[ -z "$SQLITE_FILES" ]] && read -rp "SQLite file path(s), comma separated: " SQLITE_FILES
+  else
+    [[ -z "$DATABASES" ]] && read -rp "Database name(s), comma separated (or 'all'): " DATABASES
+  fi
   if [[ -z "$CONFIG_FILE" && -z "${CLI[INTERVAL_MIN]:-}" ]]; then
     read -rp "Interval in minutes (0 = run once) [0]: " _iv || true
     INTERVAL_MIN="${_iv:-0}"
   fi
 fi
 
+# default + normalize the engine once config/CLI/prompt have all had their say
+DB_ENGINE="${DB_ENGINE:-mysql}"; DB_ENGINE="${DB_ENGINE,,}"
+
+# same for the messenger; TG_API is derived from it unless set explicitly
+MESSENGER="${MESSENGER:-telegram}"; MESSENGER="${MESSENGER,,}"
+if [[ -z "$TG_API" ]]; then
+  case "$MESSENGER" in
+    bale) TG_API="https://tapi.bale.ai" ;;
+    *)    TG_API="https://api.telegram.org" ;;
+  esac
+fi
+
 [[ -n "$BOT_TOKEN" ]] || die "bot token is empty"
 [[ -n "$CHAT_ID"   ]] || die "chat id is empty"
-[[ -n "$DATABASES" ]] || die "database list is empty"
+if [[ "$DB_ENGINE" == "sqlite" ]]; then
+  [[ -n "$SQLITE_FILES" ]] || die "sqlite file list is empty (use --sqlite-files or set SQLITE_FILES)"
+else
+  [[ -n "$DATABASES" ]] || die "database list is empty"
+fi
 [[ "$INTERVAL_MIN" =~ ^[0-9]+$ ]] || die "minutes must be a number"
 
 # ----------------------------------------------------------- dependencies ----
-DUMP_BIN=""
-for b in mysqldump mariadb-dump; do
-  if command -v "$b" >/dev/null 2>&1; then DUMP_BIN="$b"; break; fi
-done
-[[ -n "$DUMP_BIN" ]] || die "mysqldump not found. install with: apt install mysql-client"
 command -v curl >/dev/null 2>&1 || die "curl not found. install with: apt install curl"
+
+DUMP_BIN=""
+# sqlite mode just zips the given files, so it needs no db client at all
+if [[ "$DB_ENGINE" != "sqlite" ]]; then
+  for b in mysqldump mariadb-dump; do
+    if command -v "$b" >/dev/null 2>&1; then DUMP_BIN="$b"; break; fi
+  done
+  [[ -n "$DUMP_BIN" ]] || die "mysqldump not found. install with: apt install mysql-client"
+fi
 
 # 7-Zip creates real multi-volume archives (file.7z.001, .002 ...) that WinRAR
 # and 7-Zip open with a double click on the first part — no manual rejoining.
@@ -143,10 +198,10 @@ chmod 700 "$BACKUP_DIR"
 PART_BYTES="$(numfmt --from=iec "${PART_SIZE^^}" 2>/dev/null || true)"
 [[ -n "$PART_BYTES" ]] || die "invalid --part-size: $PART_SIZE (use e.g. 45m)"
 if [[ "$PART_BYTES" -gt 49000000 ]]; then
-  log "WARNING: part size $PART_SIZE is close to / above Telegram's 50MB bot limit"
+  log "WARNING: part size $PART_SIZE is close to / above the 50MB bot upload limit"
 fi
 
-# proxy for every Telegram request
+# proxy for every messenger request (Telegram is blocked in Iran, Bale is not)
 CURL_PROXY=()
 if [[ -n "$PROXY" ]]; then
   case "$PROXY" in
@@ -157,31 +212,34 @@ if [[ -n "$PROXY" ]]; then
   log "using proxy: $(sed -E 's#://[^@/]*@#://***:***@#' <<<"$PROXY")"
   curl -sS --max-time 25 "${CURL_PROXY[@]}" -o /dev/null \
        "${TG_API}/bot${BOT_TOKEN}/getMe" \
-    && log "telegram reachable through the proxy" \
-    || log "WARNING: could not reach Telegram through the proxy yet"
+    && log "${MESSENGER} reachable through the proxy" \
+    || log "WARNING: could not reach ${MESSENGER} through the proxy yet"
 fi
 
-# credentials go into a 0600 temp file so they never show up in `ps`
-MYCNF="$(mktemp)"
-chmod 600 "$MYCNF"
-cat >"$MYCNF" <<EOF
+# mysql only: credentials + dump options (sqlite needs neither)
+if [[ "$DB_ENGINE" != "sqlite" ]]; then
+  # credentials go into a 0600 temp file so they never show up in `ps`
+  MYCNF="$(mktemp)"
+  chmod 600 "$MYCNF"
+  cat >"$MYCNF" <<EOF
 [client]
 user=${DB_USER}
 password=${DB_PASS}
 host=${DB_HOST}
 port=${DB_PORT}
 EOF
-trap 'rm -f "$MYCNF"' EXIT
+  trap 'rm -f "$MYCNF"' EXIT
 
-# build dump options depending on what this server's dumper supports
-DUMP_OPTS=(--single-transaction --quick --routines --triggers --events
-           --default-character-set=utf8mb4)
-DUMP_HELP="$("$DUMP_BIN" --help 2>/dev/null || true)"
-if grep -q -- '--no-tablespaces' <<<"$DUMP_HELP"; then
-  DUMP_OPTS+=(--no-tablespaces)
-fi
-if grep -q -- '--set-gtid-purged' <<<"$DUMP_HELP"; then
-  DUMP_OPTS+=(--set-gtid-purged=OFF)
+  # build dump options depending on what this server's dumper supports
+  DUMP_OPTS=(--single-transaction --quick --routines --triggers --events
+             --default-character-set=utf8mb4)
+  DUMP_HELP="$("$DUMP_BIN" --help 2>/dev/null || true)"
+  if grep -q -- '--no-tablespaces' <<<"$DUMP_HELP"; then
+    DUMP_OPTS+=(--no-tablespaces)
+  fi
+  if grep -q -- '--set-gtid-purged' <<<"$DUMP_HELP"; then
+    DUMP_OPTS+=(--set-gtid-purged=OFF)
+  fi
 fi
 
 # ------------------------------------------------------------------ telegram --
@@ -199,7 +257,7 @@ tg_send_file() {
     if [[ "$code" == "200" ]]; then
       rm -f "$body"; return 0
     fi
-    log "telegram upload failed (http $code, try $attempt/3): $(head -c 300 "$body" 2>/dev/null)"
+    log "${MESSENGER} upload failed (http $code, try $attempt/3): $(head -c 300 "$body" 2>/dev/null)"
     rm -f "$body"
     sleep 15
   done
@@ -226,8 +284,11 @@ list_all_databases() {
 # zip mode -> base.zip           (single)   or base.zip.001.part ...        (raw split)
 ARCHIVE_PARTS=()
 create_archive() {
-  local sqlfile="$1" base="$2"
+  local src="$1" base="$2"          # src may be a single file or a directory
   ARCHIVE_PARTS=()
+  local name is_dir=0
+  name="$(basename "$src")"
+  [[ -d "$src" ]] && is_dir=1
 
   if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
     local args=(a -t7z "-mx=${COMPRESS_LEVEL}" "-v${PART_SIZE}" -y)
@@ -235,14 +296,14 @@ create_archive() {
       args+=("-p${ZIP_PASSWORD}" -mhe=on)   # -mhe also encrypts the file list
     fi
     local rc=0
-    ( cd "$BACKUP_DIR" && "$SEVENZIP" "${args[@]}" "${base}.7z" "$(basename "$sqlfile")" \
-        >/dev/null 2>"${sqlfile}.7z.err" ) || rc=$?
+    ( cd "$BACKUP_DIR" && "$SEVENZIP" "${args[@]}" "${base}.7z" "$name" \
+        >/dev/null 2>"${src}.7z.err" ) || rc=$?
     if [[ $rc -gt 1 ]]; then          # 0 = ok, 1 = warning, >1 = real error
-      log "7z failed (rc=$rc): $(tail -c 300 "${sqlfile}.7z.err" 2>/dev/null)"
-      rm -f "${sqlfile}.7z.err"
+      log "7z failed (rc=$rc): $(tail -c 300 "${src}.7z.err" 2>/dev/null)"
+      rm -f "${src}.7z.err"
       return 1
     fi
-    rm -f "${sqlfile}.7z.err" "$sqlfile"
+    rm -f "${src}.7z.err"; rm -rf "$src"
 
     mapfile -t ARCHIVE_PARTS < <(find "$BACKUP_DIR" -maxdepth 1 \
       -name "${base}.7z.[0-9][0-9][0-9]" | sort)
@@ -253,10 +314,11 @@ create_archive() {
     fi
 
   else
-    local zipargs=(-q -j)
+    local zipargs=(-q)
+    if [[ $is_dir -eq 1 ]]; then zipargs+=(-r); else zipargs+=(-j); fi
     [[ -n "$ZIP_PASSWORD" ]] && zipargs+=(-P "$ZIP_PASSWORD")
-    ( cd "$BACKUP_DIR" && zip "${zipargs[@]}" "${base}.zip" "$(basename "$sqlfile")" ) || return 1
-    rm -f "$sqlfile"
+    ( cd "$BACKUP_DIR" && zip "${zipargs[@]}" "${base}.zip" "$name" ) || return 1
+    rm -rf "$src"
     local zipfile="${BACKUP_DIR}/${base}.zip"
     if [[ "$(stat -c%s "$zipfile")" -gt "$PART_BYTES" ]]; then
       split -b "$PART_BYTES" -d -a 3 --numeric-suffixes=1 \
@@ -275,9 +337,55 @@ create_archive() {
   return 0
 }
 
+# Upload every file in the global ARCHIVE_PARTS array, with captions and,
+# for multi-part archives, a short "how to reassemble" note. Shared by the
+# mysql and sqlite backup paths.
+send_archive_parts() {
+  local label="$1" ts="$2" base="$3"
+  local parts=("${ARCHIVE_PARTS[@]}") n i p psize cap
+  n="${#parts[@]}"
+  [[ "$n" -gt 0 ]] || { log "archiving produced nothing for ${label}"; return 1; }
+
+  i=0
+  for p in "${parts[@]}"; do
+    i=$((i+1))
+    psize=$(stat -c%s "$p")
+    if [[ "$psize" -gt 52000000 ]]; then
+      log "WARNING: $(basename "$p") is larger than 50MB, the messenger will reject it. Lower --part-size."
+    fi
+    if [[ "$n" -gt 1 ]]; then
+      cap="🗄 ${label} | ${ts} | part ${i}/${n} | $(numfmt --to=iec "$psize")"
+    else
+      cap="🗄 ${label} | ${ts} | $(numfmt --to=iec "$psize")"
+    fi
+    log "sending $(basename "$p") ($i/$n)"
+    if ! tg_send_file "$p" "$cap"; then
+      log "could not send $(basename "$p")"
+      tg_send_text "❌ Failed to upload part ${i}/${n} of ${label} (${ts})"
+      return 1
+    fi
+    sleep 2
+  done
+
+  if [[ "$n" -gt 1 ]]; then
+    if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
+      tg_send_text "ℹ️ ${label} (${ts}) — ${n} parts.
+Download every part into the same folder, then right-click ${base}.7z.001 and choose Extract Here (WinRAR or 7-Zip). The other parts are picked up automatically.
+Linux: 7z x ${base}.7z.001"
+    else
+      tg_send_text "ℹ️ ${label} (${ts}) — ${n} parts.
+Download all parts into one folder, then:
+cat ${base}.zip.*.part > ${base}.zip && unzip ${base}.zip"
+    fi
+  fi
+
+  log "${label} done ($n file(s))"
+  return 0
+}
+
 backup_one_db() {
   local db="$1"
-  local ts base sqlfile parts n i sizeb
+  local ts base sqlfile sizeb
   ts="$(date '+%Y-%m-%d_%H-%M-%S')"
   base="${db}_${ts}"
   sqlfile="${BACKUP_DIR}/${base}.sql"
@@ -296,49 +404,55 @@ backup_one_db() {
   [[ "$sizeb" -gt 0 ]] || { log "empty dump for $db"; rm -f "$sqlfile"; return 1; }
   log "dump size: $(numfmt --to=iec "$sizeb")"
 
-  # compress (fills the global ARCHIVE_PARTS array)
+  # compress (fills the global ARCHIVE_PARTS array), then upload
   create_archive "$sqlfile" "$base" || { log "compression failed for $db"; return 1; }
-  parts=("${ARCHIVE_PARTS[@]}")
+  send_archive_parts "$db" "$ts" "$base"
+}
 
-  n="${#parts[@]}"
-  [[ "$n" -gt 0 ]] || { log "archiving produced nothing for $db"; return 1; }
+# ------------------------------------------------------------ sqlite handling --
+# The user's own files are taken exactly as given: every path in SQLITE_FILES is
+# copied verbatim into one folder and that folder is zipped and sent. No dump,
+# no consistency snapshot, no extra files — just the files the user listed.
+backup_sqlite() {
+  local ts base snapdir raw f bn safe target idx=0 nfiles=0
+  ts="$(date '+%Y-%m-%d_%H-%M-%S')"
+  base="sqlite_${ts}"
+  snapdir="${BACKUP_DIR}/${base}"
+  rm -rf "$snapdir"; mkdir -p "$snapdir"
 
-  i=0
-  for p in "${parts[@]}"; do
-    i=$((i+1))
-    local psize cap
-    psize=$(stat -c%s "$p")
-    if [[ "$psize" -gt 52000000 ]]; then
-      log "WARNING: $(basename "$p") is larger than 50MB, Telegram will reject it. Lower --part-size."
+  IFS=',' read -r -a raw <<<"$SQLITE_FILES"
+  for f in "${raw[@]}"; do
+    f="$(trim "$f")"
+    [[ -n "$f" ]] || continue
+    idx=$((idx+1))
+    if [[ ! -f "$f" ]]; then
+      log "sqlite: file not found, skipping: $f"
+      tg_send_text "⚠️ File not found: $f"
+      continue
     fi
-    if [[ "$n" -gt 1 ]]; then
-      cap="🗄 ${db} | ${ts} | part ${i}/${n} | $(numfmt --to=iec "$psize")"
+    bn="$(basename "$f")"
+    safe="${bn//[^A-Za-z0-9._-]/_}"     # keep it archive/shell safe
+    target="$safe"
+    [[ -e "${snapdir}/${target}" ]] && target="${idx}_${safe}"   # avoid basename clashes
+    if cp -f -- "$f" "${snapdir}/${target}"; then
+      log "sqlite: added $f"
+      nfiles=$((nfiles+1))
     else
-      cap="🗄 ${db} | ${ts} | $(numfmt --to=iec "$psize")"
+      log "sqlite: failed to copy $f"
+      tg_send_text "❌ Failed to read file: $f"
     fi
-    log "sending $(basename "$p") ($i/$n)"
-    if ! tg_send_file "$p" "$cap"; then
-      log "could not send $(basename "$p")"
-      tg_send_text "❌ Failed to upload part ${i}/${n} of ${db} (${ts})"
-      return 1
-    fi
-    sleep 2
   done
 
-  if [[ "$n" -gt 1 ]]; then
-    if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
-      tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
-Download every part into the same folder, then right-click ${base}.7z.001 and choose Extract Here (WinRAR or 7-Zip). The other parts are picked up automatically.
-Linux: 7z x ${base}.7z.001"
-    else
-      tg_send_text "ℹ️ ${db} (${ts}) — ${n} parts.
-Download all parts into one folder, then:
-cat ${base}.zip.*.part > ${base}.zip && unzip ${base}.zip"
-    fi
+  if [[ "$nfiles" -eq 0 ]]; then
+    log "sqlite: nothing to back up"
+    rm -rf "$snapdir"
+    return 1
   fi
+  log "sqlite: ${nfiles} file(s) collected"
 
-  log "database $db done ($n file(s))"
-  return 0
+  # zip the whole folder (fills ARCHIVE_PARTS), then upload
+  create_archive "$snapdir" "$base" || { log "compression failed for sqlite"; rm -rf "$snapdir"; return 1; }
+  send_archive_parts "SQLite" "$ts" "$base"
 }
 
 prune_old() {
@@ -351,6 +465,12 @@ prune_old() {
 }
 
 run_cycle() {
+  if [[ "$DB_ENGINE" == "sqlite" ]]; then
+    if backup_sqlite; then log "cycle finished: sqlite ok"; else log "cycle finished: sqlite failed"; fi
+    prune_old
+    return 0
+  fi
+
   local dbs=() ok=0 fail=0
   if [[ "${DATABASES,,}" == "all" ]]; then
     mapfile -t dbs < <(list_all_databases)
