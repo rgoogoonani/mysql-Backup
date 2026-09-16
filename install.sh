@@ -29,6 +29,21 @@ die()  { echo "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 # Bale (https://bale.ai) shares Telegram's bot API, only the host differs.
 messenger_api() { case "$MESSENGER" in bale) echo "https://tapi.bale.ai" ;; *) echo "https://api.telegram.org" ;; esac; }
 
+# Install the MySQL/MariaDB client, but only if the dumper isn't already there
+# (a local server install ships it). Called only when the MySQL engine is used,
+# so a file/SQLite backup never pulls it in.
+ensure_mysql_client() {
+  command -v mysqldump >/dev/null && return 0
+  command -v mariadb-dump >/dev/null && return 0
+  info "installing the MySQL client ..."
+  apt-get update -qq
+  if command -v mariadb >/dev/null; then
+    apt-get install -y -qq mariadb-client || die "could not install mariadb-client"
+  else
+    apt-get install -y -qq mysql-client || die "could not install mysql-client"
+  fi
+}
+
 [[ $EUID -eq 0 ]] || die "this installer must run as root:  sudo bash install.sh"
 
 # ------------------------------------------------------------------ actions --
@@ -176,6 +191,10 @@ ask_proxy() {
 ask_proxy
 
 # 1) dependencies
+# Only the tools every mode needs are installed here. The MySQL client is NOT
+# installed yet: it is pulled in later, and only if the user picks the MySQL
+# engine (see the "--- Database ---" section). A file/SQLite backup never
+# touches it.
 info "checking dependencies ..."
 export DEBIAN_FRONTEND=noninteractive
 MISSING=()
@@ -183,9 +202,6 @@ command -v curl >/dev/null || MISSING+=(curl)
 command -v zip  >/dev/null || MISSING+=(zip)
 command -v split >/dev/null || MISSING+=(coreutils)
 command -v flock >/dev/null || MISSING+=(util-linux)
-if ! command -v mysqldump >/dev/null && ! command -v mariadb-dump >/dev/null; then
-  if command -v mariadb >/dev/null; then MISSING+=(mariadb-client); else MISSING+=(mysql-client); fi
-fi
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   apt-get update -qq
   apt-get install -y -qq "${MISSING[@]}" || die "could not install dependencies: ${MISSING[*]}"
@@ -217,6 +233,11 @@ if [[ -f "$CONF_PATH" ]]; then
   if [[ -n "${SKIP_CONF:-}" && -n "$PROXY" ]] && ! grep -q '^PROXY=' "$CONF_PATH"; then
     printf '\nPROXY=%q\n' "$PROXY" >>"$CONF_PATH"
     ok "PROXY line added to the existing config"
+  fi
+  # keeping an old config: still make sure its engine's client is present
+  if [[ -n "${SKIP_CONF:-}" ]]; then
+    KEPT_ENGINE="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${DB_ENGINE:-mysql}")"
+    [[ "$KEPT_ENGINE" != "sqlite" ]] && ensure_mysql_client
   fi
 fi
 
@@ -261,6 +282,8 @@ if [[ "$DB_ENGINE" == "sqlite" ]]; then
   ok "will back up: ${SQLITE_FILES}"
 else
   # ---- MySQL / MariaDB
+  ensure_mysql_client   # only now that we know MySQL was chosen
+
   read -rp "Host [127.0.0.1]: " DB_HOST; DB_HOST="${DB_HOST:-127.0.0.1}"
   read -rp "Port [3306]: " DB_PORT; DB_PORT="${DB_PORT:-3306}"
 
