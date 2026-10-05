@@ -17,7 +17,8 @@
 - فشرده‌سازی با **7z** و تقسیم به والیوم‌های چندپارتی، دقیقاً مثل WinRAR — کافی است روی پارت اول دابل‌کلیک کنید، بقیه خودکار خوانده می‌شوند (بدون هیچ دستور CMD)
 - پشتیبانی از **رمز روی فایل آرشیو** (حتی رمزگذاری لیست فایل‌ها)
 - تقسیم خودکار به پارت‌های ۴۵ مگابایتی وقتی فایل از سقف ربات تلگرام بزرگ‌تر است
-- ساخت خودکار کاربر `backup` با **پسورد تصادفی** و کمترین دسترسی لازم
+- **چند بکاپ مستقل روی یک سرور** — هر بکاپ یک **اسم** دارد (مثلاً یکی MySQL به اسم `shop` و یکی SQLite به اسم `panel`)؛ هر کدام کانفیگ، سرویس و پوشه‌ی بکاپ جدای خودش را دارد
+- ساخت خودکار کاربر `backup_<name>` با **پسورد تصادفی** و کمترین دسترسی لازم
 - پشتیبانی از **پروکسی HTTP و SOCKS5** برای سرورهایی که به تلگرام دسترسی مستقیم ندارند (ایران)
 - ارسال دوره‌ای بر اساس **دقیقه** (مثلاً هر ۳۰ دقیقه یک بار)
 - اجرا به‌صورت سرویس `systemd` با ری‌استارت خودکار و بالا آمدن بعد از ریبوت
@@ -94,10 +95,10 @@ Choice [1]:
 
 لازم نیست کاری بکنید و چیزی هم پرسیده نمی‌شود. اسکریپت نصب خودکار:
 
-- یک کاربر به نام `backup` می‌سازد
+- یک کاربر به نام `backup_<name>` می‌سازد (`<name>` همان اسم بکاپ است؛ هر بکاپ کاربر خودش را دارد)
 - برایش یک **پسورد تصادفی ۲۸ کاراکتری** تولید می‌کند
 - فقط دسترسی‌های لازم برای بکاپ را به آن می‌دهد (نه دسترسی نوشتن یا حذف)
-- پسورد را در `/etc/mysql-tg-backup.conf` با پرمیشن `600` ذخیره می‌کند — لازم نیست حفظش کنید
+- پسورد را در `/etc/mysql-tg-backup/<name>/backup.conf` با پرمیشن `600` ذخیره می‌کند — لازم نیست حفظش کنید
 
 - بعد از ساخت، **لاگین را تست می‌کند** تا مطمئن شود واقعاً کار می‌کند
 
@@ -212,8 +213,8 @@ PROXY="http://user:pass@1.2.3.4:8080"
 </div>
 
 ```bash
-sudo nano /etc/mysql-tg-backup.conf     # خط PROXY را عوض کنید
-sudo systemctl restart mysql-tg-backup
+sudo nano /etc/mysql-tg-backup/shop/backup.conf     # خط PROXY را عوض کنید
+sudo systemctl restart mysql-tg-backup-shop
 ```
 
 <div dir="rtl">
@@ -260,10 +261,11 @@ sudo bash install.sh
 
 ۱. پیش‌نیازها را نصب می‌کند
 ۲. اسکریپت اصلی را در `/usr/local/bin/mysql-telegram-backup.sh` می‌گذارد
-۳. سؤال‌های زیر را می‌پرسد و کانفیگ را در `/etc/mysql-tg-backup.conf` ذخیره می‌کند:
+۳. سؤال‌های زیر را می‌پرسد و کانفیگ را در `/etc/mysql-tg-backup/<name>/backup.conf` ذخیره می‌کند:
 
 | سؤال | توضیح |
 |---|---|
+| اسم بکاپ | یک اسم کوتاه مثل `shop` یا `panel` (حروف کوچک انگلیسی، عدد، `-` و `_`). اسم تکراری یعنی ویرایش همان بکاپ |
 | پیام‌رسان | `1` برای تلگرام یا `2` برای بله |
 | توکن ربات | همان چیزی که BotFather داد |
 | چت آی‌دی | مقصد ارسال بکاپ |
@@ -276,7 +278,32 @@ sudo bash install.sh
 | پسورد آرشیو | خالی بگذارید اگر رمز نمی‌خواهید |
 
 ۴. اتصال به دیتابیس و ارسال پیام تست به تلگرام را چک می‌کند
-۵. سرویس `systemd` را می‌سازد و اجرا می‌کند
+۵. سرویس `systemd` را با اسم `mysql-tg-backup-<name>` می‌سازد و اجرا می‌کند
+
+### چند بکاپ روی یک سرور
+
+برای هر سرویسی که می‌خواهید بکاپ بگیرید، نصب‌کننده را **دوباره با یک اسم جدید** اجرا کنید. مثلاً یک بار با اسم `shop` برای MySQL و یک بار با اسم `panel` برای فایل SQLite. هر بکاپ کاملاً جداست:
+
+| | بکاپ `shop` | بکاپ `panel` |
+|---|---|---|
+| کانفیگ | `/etc/mysql-tg-backup/shop/backup.conf` | `/etc/mysql-tg-backup/panel/backup.conf` |
+| سرویس | `mysql-tg-backup-shop` | `mysql-tg-backup-panel` |
+| پوشه‌ی بکاپ | `/var/backups/mysql-tg/shop` | `/var/backups/mysql-tg/panel` |
+| کاربر MySQL | `backup_shop` | — |
+
+اسم بکاپ در کپشن هر فایل و هر پیام می‌آید (مثلاً `🗄 [shop] wordpress | ...`)، پس می‌توانند به یک چت هم بروند. هر کدام قفل اجرای خودش را دارد و جلوی همدیگر را نمی‌گیرند.
+
+در دستورهای پایین این راهنما، `shop` را با اسم بکاپ خودتان عوض کنید.
+
+</div>
+
+```bash
+sudo bash install.sh --list     # لیست بکاپ‌های نصب‌شده و وضعیت سرویس‌ها
+```
+
+<div dir="rtl">
+
+> **آپدیت از نسخه‌های قبلی:** اگر قبلاً نسخه‌ی بدون اسم را نصب کرده‌اید (`/etc/mysql-tg-backup.conf`)، نصب‌کننده (یا `--update`) یک اسم برایش می‌پرسد (پیش‌فرض `default`) و آن را به ساختار جدید منتقل می‌کند. پوشه‌ی بکاپ قدیمی‌اش عوض نمی‌شود.
 
 </div>
 
@@ -289,10 +316,10 @@ sudo bash install.sh
 </div>
 
 ```bash
-systemctl status mysql-tg-backup      # وضعیت سرویس
-journalctl -u mysql-tg-backup -f      # دیدن لاگ لحظه‌ای
-systemctl restart mysql-tg-backup     # ری‌استارت بعد از تغییر کانفیگ
-systemctl stop mysql-tg-backup        # توقف موقت
+systemctl status mysql-tg-backup-shop      # وضعیت سرویس
+journalctl -u mysql-tg-backup-shop -f      # دیدن لاگ لحظه‌ای
+systemctl restart mysql-tg-backup-shop     # ری‌استارت بعد از تغییر کانفیگ
+systemctl stop mysql-tg-backup-shop        # توقف موقت
 ```
 
 <div dir="rtl">
@@ -302,7 +329,7 @@ systemctl stop mysql-tg-backup        # توقف موقت
 </div>
 
 ```bash
-sudo /usr/local/bin/mysql-telegram-backup.sh -f /etc/mysql-tg-backup.conf -m 0
+sudo /usr/local/bin/mysql-telegram-backup.sh -f /etc/mysql-tg-backup/shop/backup.conf -m 0
 ```
 
 <div dir="rtl">
@@ -312,8 +339,8 @@ sudo /usr/local/bin/mysql-telegram-backup.sh -f /etc/mysql-tg-backup.conf -m 0
 </div>
 
 ```bash
-sudo nano /etc/mysql-tg-backup.conf
-sudo systemctl restart mysql-tg-backup
+sudo nano /etc/mysql-tg-backup/shop/backup.conf
+sudo systemctl restart mysql-tg-backup-shop
 ```
 
 <div dir="rtl">
@@ -346,6 +373,7 @@ sudo mysql-telegram-backup.sh -g bale -t 123:ABC -c 987654321 \
 
 | پارامتر کوتاه | پارامتر بلند | توضیح | پیش‌فرض |
 |---|---|---|---|
+| `-n` | `--name` | اسم بکاپ (در پیام‌ها می‌آید و قفل و پوشه‌ی جدا می‌دهد) | خالی |
 | `-g` | `--messenger` | پیام‌رسان: `telegram` یا `bale` | `telegram` |
 | `-t` | `--token` | توکن ربات (تلگرام یا بله) | — |
 | `-c` | `--chat-id` | چت آی‌دی مقصد | — |
@@ -357,7 +385,7 @@ sudo mysql-telegram-backup.sh -g bale -t 123:ABC -c 987654321 \
 | `-p` | `--db-pass` | پسورد MySQL | خالی |
 | `-H` | `--db-host` | هاست دیتابیس | `127.0.0.1` |
 | `-P` | `--db-port` | پورت دیتابیس | `3306` |
-| `-o` | `--out` | پوشه بکاپ | `/var/backups/mysql-tg` |
+| `-o` | `--out` | پوشه بکاپ | `/var/backups/mysql-tg/<name>` |
 | `-s` | `--part-size` | حجم هر پارت | `45m` |
 | `-a` | `--format` | فرمت آرشیو: `7z` یا `zip` | `7z` |
 | `-z` | `--zip-pass` | رمز فایل آرشیو | خالی |
@@ -472,10 +500,10 @@ copy /b mydb_...zip.001.part+mydb_...zip.002.part mydb.zip
 
 - مطمئن شوید به ربات `/start` داده‌اید
 - توکن را با این دستور تست کنید: `curl https://api.telegram.org/bot<TOKEN>/getMe`
-- اگر سرور ایران است: خط `PROXY` را در `/etc/mysql-tg-backup.conf` ست کنید و سرویس را ری‌استارت کنید. تست دستی از روی سرور:
+- اگر سرور ایران است: خط `PROXY` را در `/etc/mysql-tg-backup/<name>/backup.conf` ست کنید و سرویس را ری‌استارت کنید. تست دستی از روی سرور:
 
 ```bash
-source /etc/mysql-tg-backup.conf
+source /etc/mysql-tg-backup/shop/backup.conf
 curl --proxy "$PROXY" "https://api.telegram.org/bot$BOT_TOKEN/getMe"
 ```
 اگر این دستور جواب `"ok":true` نداد، مشکل از پروکسی یا توکن است نه از اسکریپت.
@@ -500,15 +528,15 @@ curl --proxy "$PROXY" "https://api.telegram.org/bot$BOT_TOKEN/getMe"
 
 ```bash
 sudo apt install -y 7zip || sudo apt install -y p7zip-full
-sudo sed -i 's/^ARCHIVE_FORMAT=.*/ARCHIVE_FORMAT="7z"/' /etc/mysql-tg-backup.conf
-sudo systemctl restart mysql-tg-backup
+sudo sed -i 's/^ARCHIVE_FORMAT=.*/ARCHIVE_FORMAT="7z"/' /etc/mysql-tg-backup/shop/backup.conf
+sudo systemctl restart mysql-tg-backup-shop
 ```
 </details>
 
 <details>
 <summary><b>پسورد کاربر backup را گم کرده‌ام</b></summary>
 
-پسورد داخل کانفیگ است: `sudo grep DB_PASS /etc/mysql-tg-backup.conf`
+پسورد داخل کانفیگ است: `sudo grep DB_PASS /etc/mysql-tg-backup/shop/backup.conf`
 برای عوض کردنش، `sudo bash install.sh` را دوباره اجرا کنید و بازنویسی کانفیگ را تأیید کنید.
 </details>
 
@@ -522,7 +550,7 @@ sudo systemctl restart mysql-tg-backup
 <summary><b>سرویس بالا نمی‌آید</b></summary>
 
 ```bash
-journalctl -u mysql-tg-backup -n 50 --no-pager
+journalctl -u mysql-tg-backup-shop -n 50 --no-pager
 ```
 </details>
 
@@ -535,8 +563,16 @@ journalctl -u mysql-tg-backup -n 50 --no-pager
 </div>
 
 ```bash
-sudo bash install.sh --uninstall
+sudo bash install.sh --uninstall          # می‌پرسد کدام بکاپ حذف شود
+sudo bash install.sh --uninstall shop     # فقط بکاپ shop
+sudo bash install.sh --uninstall all      # همه‌ی بکاپ‌ها
 ```
+
+<div dir="rtl">
+
+اسکریپت اصلی فقط وقتی حذف می‌شود که هیچ بکاپی باقی نمانده باشد.
+
+</div>
 
 <div dir="rtl">
 
@@ -545,14 +581,14 @@ sudo bash install.sh --uninstall
 </div>
 
 ```bash
-sudo bash install.sh --update
+sudo bash install.sh --update     # اسکریپت را عوض می‌کند و همه‌ی سرویس‌ها را ری‌استارت می‌کند
 ```
 
 <div dir="rtl">
 
 ## ⚠️ نکات امنیتی
 
-- فایل `/etc/mysql-tg-backup.conf` شامل پسورد دیتابیس و توکن رباتتان است؛ پرمیشن آن `600` است، آن را تغییر ندهید.
+- فایل `/etc/mysql-tg-backup/<name>/backup.conf` شامل پسورد دیتابیس و توکن رباتتان است؛ پرمیشن آن `600` است، آن را تغییر ندهید.
 - **بکاپ دیتابیس رمزنگاری‌نشده در تلگرام ذخیره می‌شود.** اگر داده حساس دارید حتماً `ZIP_PASSWORD` را ست کنید (در فرمت 7z با `-mhe=on` حتی نام فایل‌ها هم رمز می‌شود).
 - بکاپ را در یک کانال **خصوصی** بفرستید، نه گروه عمومی.
 - توکن ربات را داخل ریپازیتوری یا اسکرین‌شات منتشر نکنید. اگر لو رفت، در BotFather با `/revoke` باطلش کنید.

@@ -13,6 +13,7 @@ set -Eeuo pipefail
 # Bale (https://bale.ai) is an Iranian messenger with the exact same bot API as
 # Telegram, only a different host. Pick the target here; the token/chat id are
 # whatever that messenger's BotFather-equivalent gave you.
+BACKUP_NAME="${BACKUP_NAME:-}"          # name of this backup instance (shown in messages)
 MESSENGER="${MESSENGER:-}"              # telegram (default) or bale
 BOT_TOKEN="${BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-}"
@@ -24,7 +25,7 @@ DB_USER="${DB_USER:-root}"
 DB_PASS="${DB_PASS:-}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
-BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql-tg}"
+BACKUP_DIR="${BACKUP_DIR:-}"            # default /var/backups/mysql-tg[/<name>]
 PART_SIZE="${PART_SIZE:-45m}"           # each part size (keep under 50m)
 ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-7z}"  # 7z = WinRAR-style volumes | zip = plain zip
 COMPRESS_LEVEL="${COMPRESS_LEVEL:-5}"   # 0..9 for 7z
@@ -48,6 +49,8 @@ usage() {
 mysql-telegram-backup.sh
 
 Options:
+  -n, --name NAME          Name of this backup instance (shown in every message,
+                           gives it its own lock and default backup folder)
   -g, --messenger NAME     Send with telegram (default) or bale
   -t, --token TOKEN        Bot token                     (required)
   -c, --chat-id ID         Destination chat id           (required)
@@ -61,7 +64,7 @@ Options:
   -H, --db-host HOST       MySQL host        (default 127.0.0.1)
   -P, --db-port PORT       MySQL port        (default 3306)
 
-  -o, --out DIR            Backup directory  (default /var/backups/mysql-tg)
+  -o, --out DIR            Backup directory  (default /var/backups/mysql-tg/<name>)
   -s, --part-size SIZE     Part size, e.g. 45m  (default 45m)
   -a, --format 7z|zip      Archive format (default 7z: WinRAR-style volumes)
   -z, --zip-pass PASS      Password protect the archive  (optional)
@@ -71,7 +74,7 @@ Options:
   -h, --help               This help
 
 Every option can also be given as an environment variable:
-MESSENGER BOT_TOKEN CHAT_ID DB_ENGINE DATABASES SQLITE_FILES INTERVAL_MIN DB_USER
+BACKUP_NAME MESSENGER BOT_TOKEN CHAT_ID DB_ENGINE DATABASES SQLITE_FILES INTERVAL_MIN DB_USER
 DB_PASS DB_HOST DB_PORT BACKUP_DIR PART_SIZE ARCHIVE_FORMAT ZIP_PASSWORD KEEP_DAYS
 PROXY TG_API
 EOF
@@ -82,6 +85,7 @@ CONFIG_FILE=""
 declare -A CLI=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -n|--name)       CLI[BACKUP_NAME]="$2"; shift 2 ;;
     -g|--messenger)  CLI[MESSENGER]="$2"; shift 2 ;;
     -t|--token)      CLI[BOT_TOKEN]="$2"; shift 2 ;;
     -c|--chat-id)    CLI[CHAT_ID]="$2"; shift 2 ;;
@@ -163,6 +167,14 @@ else
   [[ -n "$DATABASES" ]] || die "database list is empty"
 fi
 [[ "$INTERVAL_MIN" =~ ^[0-9]+$ ]] || die "minutes must be a number"
+if [[ -n "$BACKUP_NAME" ]]; then
+  [[ "$BACKUP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid name: $BACKUP_NAME (letters, digits, - and _)"
+  BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql-tg/${BACKUP_NAME}}"
+else
+  BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql-tg}"
+fi
+# prefix for every message, so backups of several instances can share one chat
+TAG=""; [[ -n "$BACKUP_NAME" ]] && TAG="[${BACKUP_NAME}] "
 
 # ----------------------------------------------------------- dependencies ----
 command -v curl >/dev/null 2>&1 || die "curl not found. install with: apt install curl"
@@ -354,14 +366,14 @@ send_archive_parts() {
       log "WARNING: $(basename "$p") is larger than 50MB, the messenger will reject it. Lower --part-size."
     fi
     if [[ "$n" -gt 1 ]]; then
-      cap="🗄 ${label} | ${ts} | part ${i}/${n} | $(numfmt --to=iec "$psize")"
+      cap="🗄 ${TAG}${label} | ${ts} | part ${i}/${n} | $(numfmt --to=iec "$psize")"
     else
-      cap="🗄 ${label} | ${ts} | $(numfmt --to=iec "$psize")"
+      cap="🗄 ${TAG}${label} | ${ts} | $(numfmt --to=iec "$psize")"
     fi
     log "sending $(basename "$p") ($i/$n)"
     if ! tg_send_file "$p" "$cap"; then
       log "could not send $(basename "$p")"
-      tg_send_text "❌ Failed to upload part ${i}/${n} of ${label} (${ts})"
+      tg_send_text "❌ ${TAG}Failed to upload part ${i}/${n} of ${label} (${ts})"
       return 1
     fi
     sleep 2
@@ -369,11 +381,11 @@ send_archive_parts() {
 
   if [[ "$n" -gt 1 ]]; then
     if [[ "$ARCHIVE_FORMAT" == "7z" ]]; then
-      tg_send_text "ℹ️ ${label} (${ts}) — ${n} parts.
+      tg_send_text "ℹ️ ${TAG}${label} (${ts}) — ${n} parts.
 Download every part into the same folder, then right-click ${base}.7z.001 and choose Extract Here (WinRAR or 7-Zip). The other parts are picked up automatically.
 Linux: 7z x ${base}.7z.001"
     else
-      tg_send_text "ℹ️ ${label} (${ts}) — ${n} parts.
+      tg_send_text "ℹ️ ${TAG}${label} (${ts}) — ${n} parts.
 Download all parts into one folder, then:
 cat ${base}.zip.*.part > ${base}.zip && unzip ${base}.zip"
     fi
@@ -394,7 +406,7 @@ backup_one_db() {
   if ! "$DUMP_BIN" --defaults-extra-file="$MYCNF" "${DUMP_OPTS[@]}" \
         --databases "$db" >"$sqlfile" 2>"${sqlfile}.err"; then
     log "dump failed for $db: $(tail -c 400 "${sqlfile}.err")"
-    tg_send_text "❌ Backup failed for database: ${db}"
+    tg_send_text "❌ ${TAG}Backup failed for database: ${db}"
     rm -f "$sqlfile" "${sqlfile}.err"
     return 1
   fi
@@ -416,7 +428,7 @@ backup_one_db() {
 backup_sqlite() {
   local ts base snapdir raw f bn safe target idx=0 nfiles=0
   ts="$(date '+%Y-%m-%d_%H-%M-%S')"
-  base="sqlite_${ts}"
+  base="${BACKUP_NAME:-sqlite}_${ts}"
   snapdir="${BACKUP_DIR}/${base}"
   rm -rf "$snapdir"; mkdir -p "$snapdir"
 
@@ -427,7 +439,7 @@ backup_sqlite() {
     idx=$((idx+1))
     if [[ ! -f "$f" ]]; then
       log "sqlite: file not found, skipping: $f"
-      tg_send_text "⚠️ File not found: $f"
+      tg_send_text "⚠️ ${TAG}File not found: $f"
       continue
     fi
     bn="$(basename "$f")"
@@ -439,7 +451,7 @@ backup_sqlite() {
       nfiles=$((nfiles+1))
     else
       log "sqlite: failed to copy $f"
-      tg_send_text "❌ Failed to read file: $f"
+      tg_send_text "❌ ${TAG}Failed to read file: $f"
     fi
   done
 
@@ -489,8 +501,9 @@ run_cycle() {
 }
 
 # -------------------------------------------------------------------- main ---
-# a lock so two cycles never overlap on long backups
-LOCKFILE="/var/lock/mysql-telegram-backup.lock"
+# a lock so two cycles never overlap on long backups; one lock per named
+# instance, so different backups on the same server run independently
+LOCKFILE="/var/lock/mysql-telegram-backup${BACKUP_NAME:+-${BACKUP_NAME}}.lock"
 exec 9>"$LOCKFILE" || LOCKFILE=""
 if [[ -n "$LOCKFILE" ]] && ! flock -n 9; then
   die "another instance is already running"
@@ -499,7 +512,7 @@ fi
 if [[ "$INTERVAL_MIN" -eq 0 ]]; then
   run_cycle
 else
-  log "starting loop: every ${INTERVAL_MIN} minute(s)"
+  log "${TAG}starting loop: every ${INTERVAL_MIN} minute(s)"
   while true; do
     run_cycle || log "cycle returned an error, continuing"
     sleep $(( INTERVAL_MIN * 60 ))

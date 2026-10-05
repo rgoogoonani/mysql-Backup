@@ -3,19 +3,32 @@
 # install.sh — installer for mysql-telegram-backup
 # repo: https://github.com/rgoogoonani/mysql-Baclup
 #
-#   sudo bash install.sh              install / reconfigure
-#   sudo bash install.sh --uninstall  remove everything
-#   sudo bash install.sh --update     only replace the script with the latest one
+#   sudo bash install.sh                     install a new backup instance / reconfigure one
+#   sudo bash install.sh --list              show the installed backup instances
+#   sudo bash install.sh --uninstall [NAME]  remove one instance (or "all")
+#   sudo bash install.sh --update            only replace the script and restart every instance
+#
+# Every backup instance has its own name. One server can run several of them
+# side by side (e.g. one MySQL and one SQLite), each with its own config
+# folder, systemd service and backup directory:
+#   /etc/mysql-tg-backup/<name>/backup.conf
+#   mysql-tg-backup-<name>.service
+#   /var/backups/mysql-tg/<name>/
 
 set -Eeuo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/rgoogoonani/mysql-Baclup"
 SCRIPT_NAME="mysql-telegram-backup.sh"
 BIN_PATH="/usr/local/bin/${SCRIPT_NAME}"
-CONF_PATH="/etc/mysql-tg-backup.conf"
-SERVICE_NAME="mysql-tg-backup"
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
-DEFAULT_BACKUP_DIR="/var/backups/mysql-tg"
+CONF_ROOT="/etc/mysql-tg-backup"          # one sub folder per instance
+SERVICE_PREFIX="mysql-tg-backup"           # service = mysql-tg-backup-<name>
+BACKUP_ROOT="/var/backups/mysql-tg"        # backups = /var/backups/mysql-tg/<name>
+# layout of versions before named instances (migrated automatically)
+LEGACY_CONF="/etc/mysql-tg-backup.conf"
+LEGACY_SERVICE="mysql-tg-backup"
+
+# set by set_instance once the name is known
+BACKUP_NAME=""; CONF_DIR=""; CONF_PATH=""; SERVICE_NAME=""; SERVICE_PATH=""; DEFAULT_BACKUP_DIR=""
 
 PROXY="${PROXY:-}"
 CURL_PROXY=()
@@ -44,17 +57,106 @@ ensure_mysql_client() {
   fi
 }
 
+# --------------------------------------------------------------- instances --
+# A name becomes part of a path, a systemd unit and a MySQL user name, so keep
+# it short and plain: lowercase letters, digits, - and _ (max 24 chars).
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,23}$ ]]; }
+
+set_instance() {
+  BACKUP_NAME="$1"
+  CONF_DIR="${CONF_ROOT}/${BACKUP_NAME}"
+  CONF_PATH="${CONF_DIR}/backup.conf"
+  SERVICE_NAME="${SERVICE_PREFIX}-${BACKUP_NAME}"
+  SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+  DEFAULT_BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_NAME}"
+}
+
+list_instances() {
+  local d
+  [[ -d "$CONF_ROOT" ]] || return 0
+  for d in "$CONF_ROOT"/*/; do
+    [[ -f "${d}backup.conf" ]] && basename "$d"
+  done
+  return 0
+}
+
+write_service() {
+  cat >"$SERVICE_PATH" <<EOF
+[Unit]
+Description=Backup '${BACKUP_NAME}' to Telegram/Bale
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BIN_PATH} -f ${CONF_PATH}
+Restart=always
+RestartSec=30
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Older versions had a single, unnamed backup: /etc/mysql-tg-backup.conf and
+# mysql-tg-backup.service. Move it into the named layout so it keeps running
+# next to new instances. Its BACKUP_DIR is left as it was.
+migrate_legacy() {
+  [[ -f "$LEGACY_CONF" ]] || return 0
+  echo
+  warn "found a backup from an older version: ${LEGACY_CONF}"
+  echo "It will be moved to the new layout and needs a name."
+  local n
+  while true; do
+    read -rp "Name for the existing backup [default]: " n; n="${n:-default}"
+    valid_name "$n" || { warn "use lowercase letters, digits, - and _ (max 24 chars)"; continue; }
+    [[ -e "${CONF_ROOT}/${n}" ]] && { warn "the name '${n}' is already in use"; continue; }
+    break
+  done
+  systemctl disable --now "$LEGACY_SERVICE" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${LEGACY_SERVICE}.service"
+  set_instance "$n"
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  mv -f "$LEGACY_CONF" "$CONF_PATH"; chmod 600 "$CONF_PATH"
+  grep -q '^BACKUP_NAME=' "$CONF_PATH" || printf '\nBACKUP_NAME=%q\n' "$n" >>"$CONF_PATH"
+  write_service
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+  [[ -x "$BIN_PATH" ]] && systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+  ok "old backup migrated: ${CONF_PATH} (service ${SERVICE_NAME})"
+}
+
 [[ $EUID -eq 0 ]] || die "this installer must run as root:  sudo bash install.sh"
 
 # ------------------------------------------------------------------ actions --
 ACTION="install"
 case "${1:-}" in
-  --uninstall|-u) ACTION="uninstall" ;;
+  --uninstall|-u) ACTION="uninstall"; UNINSTALL_NAME="${2:-}" ;;
   --update)       ACTION="update" ;;
-  --help|-h)      sed -n '2,10p' "$0"; exit 0 ;;
+  --list|-l)      ACTION="list" ;;
+  --help|-h)      sed -n '2,17p' "$0"; exit 0 ;;
   "")             ;;
   *)              die "unknown option: $1" ;;
 esac
+
+# --------------------------------------------------------------------- list --
+if [[ "$ACTION" == "list" ]]; then
+  mapfile -t NAMES < <(list_instances)
+  [[ ${#NAMES[@]} -gt 0 ]] || { info "no backup instances installed"; exit 0; }
+  printf '%-24s %-8s %-10s %s\n' NAME ENGINE STATE CONFIG
+  for n in "${NAMES[@]}"; do
+    set_instance "$n"
+    eng="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${DB_ENGINE:-mysql}")"
+    st="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    printf '%-24s %-8s %-10s %s\n' "$n" "$eng" "${st:-unknown}" "$CONF_PATH"
+  done
+  [[ -f "$LEGACY_CONF" ]] && warn "an unnamed old-style backup exists (${LEGACY_CONF}); run the installer to migrate it"
+  exit 0
+fi
 
 fetch_script() {
   local here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,46 +183,85 @@ fetch_script() {
 }
 
 # ---------------------------------------------------------------- uninstall --
-if [[ "$ACTION" == "uninstall" ]]; then
+uninstall_instance() {
+  set_instance "$1"
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "$SERVICE_PATH"; systemctl daemon-reload 2>/dev/null || true
-  rm -f "$BIN_PATH"
-  ok "service and script removed"
+  ok "service ${SERVICE_NAME} removed"
+  local bdir="$DEFAULT_BACKUP_DIR" a
   if [[ -f "$CONF_PATH" ]]; then
+    local DUSER
     # shellcheck disable=SC1090
-    ( source "$CONF_PATH" >/dev/null 2>&1; echo "${DB_USER:-}" ) >/tmp/.duser
-    DUSER="$(cat /tmp/.duser)"; rm -f /tmp/.duser
+    DUSER="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${DB_USER:-}")"
+    bdir="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}")"
     if [[ -n "$DUSER" && "$DUSER" != "root" ]]; then
       read -rp "also drop the MySQL user '${DUSER}'? [y/N]: " a
       if [[ "${a,,}" == "y" ]]; then
+        local SQLBIN
         SQLBIN="$(command -v mysql || command -v mariadb || true)"
         if [[ -n "$SQLBIN" ]] && "$SQLBIN" --protocol=socket -e \
-             "DROP USER IF EXISTS '${DUSER}'@'localhost'; DROP USER IF EXISTS '${DUSER}'@'127.0.0.1';" 2>/dev/null; then
+             "DROP USER IF EXISTS '${DUSER}'@'localhost'; DROP USER IF EXISTS '${DUSER}'@'127.0.0.1'; DROP USER IF EXISTS '${DUSER}'@'%';" 2>/dev/null; then
           ok "user ${DUSER} dropped"
         else
           warn "could not drop the user, run it manually: DROP USER '${DUSER}'@'localhost';"
         fi
       fi
     fi
-    read -rp "also delete the config ${CONF_PATH}? [y/N]: " a
-    [[ "${a,,}" == "y" ]] && rm -f "$CONF_PATH" && ok "config deleted"
+    read -rp "also delete the config folder ${CONF_DIR}? [y/N]: " a
+    [[ "${a,,}" == "y" ]] && rm -rf "$CONF_DIR" && ok "config deleted"
   fi
-  if [[ -d "$DEFAULT_BACKUP_DIR" ]]; then
-    read -rp "also delete local backups in ${DEFAULT_BACKUP_DIR}? [y/N]: " a
-    [[ "${a,,}" == "y" ]] && rm -rf "$DEFAULT_BACKUP_DIR" && ok "backup directory deleted"
+  if [[ -d "$bdir" ]]; then
+    read -rp "also delete local backups in ${bdir}? [y/N]: " a
+    [[ "${a,,}" == "y" ]] && rm -rf "$bdir" && ok "backup directory deleted"
+  fi
+}
+
+if [[ "$ACTION" == "uninstall" ]]; then
+  migrate_legacy
+  mapfile -t NAMES < <(list_instances)
+  [[ ${#NAMES[@]} -gt 0 ]] || { info "no backup instances installed"; rm -f "$BIN_PATH"; exit 0; }
+  target="${UNINSTALL_NAME:-}"
+  if [[ -z "$target" ]]; then
+    echo "Installed backups: ${NAMES[*]}"
+    read -rp "Which one to remove? (a name, or 'all'): " target
+  fi
+  if [[ "$target" == "all" ]]; then
+    for n in "${NAMES[@]}"; do echo; info "removing '${n}' ..."; uninstall_instance "$n"; done
+  else
+    [[ " ${NAMES[*]} " == *" ${target} "* ]] || die "no backup named '${target}' (installed: ${NAMES[*]})"
+    uninstall_instance "$target"
+  fi
+  # the shared script goes only when no instance service is left
+  if ! ls /etc/systemd/system/"${SERVICE_PREFIX}"-*.service >/dev/null 2>&1; then
+    rm -f "$BIN_PATH"
+    rmdir "$CONF_ROOT" "$BACKUP_ROOT" 2>/dev/null || true
+    ok "no backups left, script ${BIN_PATH} removed"
   fi
   exit 0
 fi
 
 # ------------------------------------------------------------------- update --
 if [[ "$ACTION" == "update" ]]; then
-  if [[ -f "$CONF_PATH" ]]; then
+  migrate_legacy
+  mapfile -t NAMES < <(list_instances)
+  # take the proxy from the first instance that has one
+  for n in "${NAMES[@]}"; do
+    set_instance "$n"
     # shellcheck disable=SC1090
     PROXY="$(source "$CONF_PATH" >/dev/null 2>&1; echo "${PROXY:-}")"
-    [[ -n "$PROXY" ]] && CURL_PROXY=(--proxy "$PROXY") && info "using the proxy from the config"
-  fi
+    [[ -n "$PROXY" ]] && { CURL_PROXY=(--proxy "$PROXY"); info "using the proxy from ${CONF_PATH}"; break; }
+  done
   fetch_script
-  systemctl restart "$SERVICE_NAME" 2>/dev/null && ok "service restarted" || true
+  for n in "${NAMES[@]}"; do
+    set_instance "$n"
+    # rewrite the unit too, so service changes in new versions reach old installs
+    write_service
+  done
+  systemctl daemon-reload
+  for n in "${NAMES[@]}"; do
+    set_instance "$n"
+    systemctl restart "$SERVICE_NAME" 2>/dev/null && ok "service ${SERVICE_NAME} restarted" || true
+  done
   exit 0
 fi
 
@@ -129,6 +270,26 @@ echo
 echo "==================================================="
 echo "   MySQL → Telegram / Bale Backup — installer"
 echo "==================================================="
+echo
+
+migrate_legacy
+
+# --------------------------------------------------------- 0) name ---
+# Each backup gets its own name, config folder and service, so several can
+# run on one server (e.g. one for MySQL and one for an SQLite file).
+EXISTING="$(list_instances | tr '\n' ' ')"
+echo "--- Backup name ---"
+[[ -n "$EXISTING" ]] && echo "Already installed on this server: ${EXISTING}"
+echo "Give this backup a short name, e.g. shop, panel, wordpress."
+echo "Use an existing name to reconfigure that backup."
+while true; do
+  read -rp "Backup name: " bname
+  bname="$(echo "$bname" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  valid_name "$bname" && break
+  warn "use lowercase letters, digits, - and _ only (max 24 chars, must start with a letter or digit)"
+done
+set_instance "$bname"
+ok "name: ${BACKUP_NAME}  (service ${SERVICE_NAME}, config ${CONF_PATH})"
 echo
 
 # --------------------------------------------------------- 0a) messenger ---
@@ -226,9 +387,10 @@ fi
 fetch_script
 
 # 3) configuration
+mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
 if [[ -f "$CONF_PATH" ]]; then
   echo
-  read -rp "A config already exists. Overwrite it? [y/N]: " a
+  read -rp "A config for '${BACKUP_NAME}' already exists. Overwrite it? [y/N]: " a
   [[ "${a,,}" == "y" ]] || { info "keeping the existing config"; SKIP_CONF=1; }
   if [[ -n "${SKIP_CONF:-}" && -n "$PROXY" ]] && ! grep -q '^PROXY=' "$CONF_PATH"; then
     printf '\nPROXY=%q\n' "$PROXY" >>"$CONF_PATH"
@@ -335,7 +497,9 @@ else
   }
 
   create_backup_user() {
-    local BK_USER="backup" GEN_PASS SQL h hosts GRANTS
+    # one MySQL user per backup instance, so reinstalling one never changes
+    # the password another instance is using (max 32 chars: 7 + 24)
+    local BK_USER="backup_${BACKUP_NAME//-/_}" GEN_PASS SQL h hosts GRANTS
     # 28 chars, letters+digits only so no SQL/shell quoting surprises
     GEN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 28)"
     # 'localhost' matches socket connections, '127.0.0.1' matches TCP;
@@ -424,6 +588,8 @@ fi   # end MySQL / SQLite branch
   # is sourced.
   {
     echo "# mysql-telegram-backup config - generated $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "# name of this backup: shown in every message, keeps instances apart"
+    printf 'BACKUP_NAME=%q\n' "$BACKUP_NAME"
     echo "# messenger: telegram or bale (bale uses https://tapi.bale.ai)"
     printf 'MESSENGER=%q\n' "$MESSENGER"
     printf 'DB_ENGINE=%q\n' "$DB_ENGINE"
@@ -485,7 +651,7 @@ fi   # end MySQL / SQLite branch
   info "sending a test message to ${MESSENGER} ..."
   if curl -sS --max-time 30 "${CURL_PROXY[@]}" -o /dev/null -f \
        -F "chat_id=${CHAT_ID}" \
-       -F "text=✅ MySQL backup installed on $(hostname)" \
+       -F "text=✅ Backup '${BACKUP_NAME}' (${DB_ENGINE}) installed on $(hostname)" \
        "$(messenger_api)/bot${BOT_TOKEN}/sendMessage"; then
     ok "test message sent"
   else
@@ -494,26 +660,8 @@ fi   # end MySQL / SQLite branch
 fi
 
 # 4) systemd service
-info "creating the systemd service ..."
-cat >"$SERVICE_PATH" <<EOF
-[Unit]
-Description=MySQL backup to Telegram/Bale
-After=network-online.target mysql.service mariadb.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${BIN_PATH} -f ${CONF_PATH}
-Restart=always
-RestartSec=30
-Nice=10
-IOSchedulingClass=idle
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+info "creating the systemd service ${SERVICE_NAME} ..."
+write_service
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 systemctl restart "$SERVICE_NAME"
@@ -531,6 +679,8 @@ cat <<EOF
 ===================================================
 ${GREEN}Installation complete${NC}
 
+  name:        ${BACKUP_NAME}
+  service:     ${SERVICE_NAME}
   config:      ${CONF_PATH}
   script:      ${BIN_PATH}
   backups:     ${DEFAULT_BACKUP_DIR}
@@ -545,5 +695,8 @@ Run one backup right now (no loop):
 
 Change settings:
   nano ${CONF_PATH} && systemctl restart ${SERVICE_NAME}
+
+Add another backup (e.g. an SQLite file): run the installer again
+with a different name.  List them all:  sudo bash install.sh --list
 ===================================================
 EOF
